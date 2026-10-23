@@ -2547,3 +2547,77 @@ async def word_live_insert_equation(
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+async def word_live_update_field_code(
+    filename: str = None,
+    field_index: int = 1,
+    new_code: str = "",
+    update_field: bool = False,
+) -> str:
+    """[Windows only] Update the field instruction code for a specific field index.
+
+    Wraps the modification in a single Word UndoRecord so it can be reverted with Ctrl+Z or word_live_undo.
+    Useful for retargeting an EndNote citation to a different record number or updating field parameters.
+
+    Args:
+        filename: Document name or path (None = active document).
+        field_index: 1-based field index in Document.Fields (required).
+        new_code: Replacement field instruction code string.
+        update_field: If True, calls Field.Update() immediately to recalculate the result (default False).
+
+    Returns:
+        JSON with success status, old code, new code, and result preview.
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    if field_index < 1:
+        return json.dumps({"error": "field_index must be >= 1 (1-indexed)"})
+
+    if not new_code:
+        return json.dumps({"error": "new_code must not be empty"})
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document, undo_record
+        from word_document_server.utils.field_utils import get_field_type_name, parse_endnote_field_code
+
+        app = get_word_app(filename)
+        doc = find_document(app, filename)
+
+        if field_index > doc.Fields.Count:
+            return json.dumps({
+                "error": f"field_index {field_index} is out of range (document has {doc.Fields.Count} fields, 1-indexed)"
+            })
+
+        f = doc.Fields(field_index)
+        old_code = str(f.Code.Text) if f.Code and f.Code.Text else ""
+
+        with undo_record(app, "MCP: Update Field Code"):
+            f.Code.Text = new_code
+            if update_field:
+                f.Update()
+
+        result_text = str(f.Result.Text) if f.Result and f.Result.Text else ""
+        type_id = int(f.Type) if hasattr(f, "Type") else -1
+
+        return json.dumps({
+            "success": True,
+            "document": doc.Name,
+            "field_index": field_index,
+            "type": get_field_type_name(type_id),
+            "old_code": old_code,
+            "new_code": new_code,
+            "updated": update_field,
+            "result_preview": result_text[:200],
+            "endnote": parse_endnote_field_code(new_code),
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })

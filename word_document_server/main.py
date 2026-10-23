@@ -1451,6 +1451,54 @@ def register_tools():
 
     @mcp.tool(
         annotations=ToolAnnotations(
+            title="Word Live List Fields",
+            readOnlyHint=True,
+        ),
+        description=live_read_tools.word_live_list_fields.__doc__,
+    )
+    def word_live_list_fields(
+        filename: str = None,
+        field_type: str = None,
+        contains: str = None,
+        include_code: bool = True,
+        include_result: bool = True,
+        max_result_chars: int = 200,
+        max_code_chars: int = 500,
+        include_all_stories: bool = False,
+        limit: int = 200,
+    ):
+        return live_read_tools.word_live_list_fields(
+            filename=filename,
+            field_type=field_type,
+            contains=contains,
+            include_code=include_code,
+            include_result=include_result,
+            max_result_chars=max_result_chars,
+            max_code_chars=max_code_chars,
+            include_all_stories=include_all_stories,
+            limit=limit,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Word Live Get Field",
+            readOnlyHint=True,
+        ),
+        description=live_read_tools.word_live_get_field.__doc__,
+    )
+    def word_live_get_field(
+        filename: str = None,
+        field_index: int = None,
+        char_position: int = None,
+    ):
+        return live_read_tools.word_live_get_field(
+            filename=filename,
+            field_index=field_index,
+            char_position=char_position,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
             title="Word Live Get Undo History",
             readOnlyHint=True,
         ),
@@ -1594,6 +1642,26 @@ def register_tools():
         Requires Word running."""
         return live_tools.word_live_insert_equation(
             filename, equation, paragraph_index, position, display_mode
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Word Live Update Field Code",
+            destructiveHint=True,
+        ),
+        description=live_tools.word_live_update_field_code.__doc__,
+    )
+    def word_live_update_field_code(
+        filename: str = None,
+        field_index: int = 1,
+        new_code: str = "",
+        update_field: bool = False,
+    ):
+        return live_tools.word_live_update_field_code(
+            filename=filename,
+            field_index=field_index,
+            new_code=new_code,
+            update_field=update_field,
         )
 
     @mcp.tool(

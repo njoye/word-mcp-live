@@ -10,7 +10,39 @@ import unicodedata
 from contextlib import contextmanager
 
 
-def get_word_app():
+def _get_app_from_file(filename: str):
+    """Attempt to reach Word.Application by binding to an open document via GetObject."""
+    if not filename:
+        return None
+    try:
+        import win32com.client
+        candidates = []
+        if os.path.isabs(filename):
+            candidates.append(filename)
+        else:
+            candidates.append(os.path.abspath(filename))
+            user_docs = os.path.join(os.path.expanduser('~'), 'Documents', filename)
+            candidates.append(user_docs)
+            candidates.append(filename)
+
+        for path in candidates:
+            if os.path.exists(path):
+                doc_obj = win32com.client.GetObject(os.path.abspath(path))
+                if doc_obj is not None and hasattr(doc_obj, "Application"):
+                    app = doc_obj.Application
+                    # Keep COM reference alive on the application instance so Word doesn't release the document
+                    app._doc_ref = doc_obj
+                    if hasattr(app, "Documents") and app.Documents.Count > 0:
+                        return app
+    except Exception:
+        pass
+    return None
+
+
+_CACHED_APP = None
+
+
+def get_word_app(filename: str = None):
     """Get a reference to the running Word application via COM.
 
     Returns the Word.Application COM object that has open documents.
@@ -21,23 +53,44 @@ def get_word_app():
     if sys.platform != "win32":
         raise RuntimeError("Word COM automation is only available on Windows")
 
+    global _CACHED_APP
+    if _CACHED_APP is not None:
+        try:
+            if hasattr(_CACHED_APP, "Documents") and _CACHED_APP.Documents.Count > 0:
+                return _CACHED_APP
+        except Exception:
+            _CACHED_APP = None
+
     import win32com.client
 
     try:
         app = win32com.client.GetActiveObject("Word.Application")
         if app.Documents.Count > 0:
+            _CACHED_APP = app
             return app
         # GetActiveObject found an empty instance — scan ROT for others
         app_with_docs = _find_word_with_docs()
         if app_with_docs is not None:
+            _CACHED_APP = app_with_docs
             return app_with_docs
+        if filename:
+            app_from_file = _get_app_from_file(filename)
+            if app_from_file is not None:
+                _CACHED_APP = app_from_file
+                return app_from_file
         # No instance has documents; return the empty one (caller may open a file)
         return app
     except Exception:
         # GetActiveObject failed entirely — try ROT scan
         app_with_docs = _find_word_with_docs()
         if app_with_docs is not None:
+            _CACHED_APP = app_with_docs
             return app_with_docs
+        if filename:
+            app_from_file = _get_app_from_file(filename)
+            if app_from_file is not None:
+                _CACHED_APP = app_from_file
+                return app_from_file
         raise RuntimeError(
             "Microsoft Word is not running. Please open Word first."
         )

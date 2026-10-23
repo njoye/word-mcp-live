@@ -189,6 +189,7 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_insert_image` | Insert an image with sizing, alignment, wrapping, and optional border |
 | `word_live_insert_cross_reference` | Insert a live cross-reference to headings, bookmarks, figures, tables, equations, footnotes, or endnotes |
 | `word_live_insert_equation` | Insert a mathematical equation using UnicodeMath syntax |
+| `word_live_update_field_code` | Update field instruction code (wrapped in undo record, optional recalculate) |
 
 </details>
 
@@ -209,6 +210,8 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_get_undo_history` | List undo stack entries |
 | `word_live_list_cross_reference_items` | List available cross-reference targets (headings, bookmarks, figures, tables) with indices |
 | `word_live_diagnose_layout` | Scan for layout problems (keep_with_next chains, style misuse, break issues) |
+| `word_live_list_fields` | Enumerate all fields, hidden instructions, results, offsets, and parsed EndNote citations |
+| `word_live_get_field` | Get single field by index or character position with untruncated code/result |
 
 </details>
 

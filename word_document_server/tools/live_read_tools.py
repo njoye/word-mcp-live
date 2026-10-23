@@ -1678,3 +1678,344 @@ async def word_live_list_open() -> str:
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Field code / EndNote inspection tools
+# ---------------------------------------------------------------------------
+
+async def word_live_list_fields(
+    filename: str = None,
+    field_type: str = None,
+    contains: str = None,
+    include_code: bool = True,
+    include_result: bool = True,
+    max_result_chars: int = 200,
+    max_code_chars: int = 500,
+    include_all_stories: bool = False,
+    limit: int = 200,
+) -> str:
+    """[Windows only] Enumerate all fields in an open Word document via Document.Fields.
+
+    Exposes hidden field codes (w:instrText), displayed results, character offsets,
+    and structured EndNote CWYW citation metadata (Record Numbers, Authors, Years).
+    Works on unsaved in-memory documents without altering Word display state.
+
+    Args:
+        filename: Document name or path (None = active document).
+        field_type: Filter by field type name or ID (e.g. "cite", "addin", "ref", "toc", "page").
+            "cite" matches EndNote Addin citation fields and Word Citation fields.
+        contains: Case-insensitive substring filter applied to field code text or result text.
+        include_code: Include code text/preview in response (default True).
+        include_result: Include result text preview in response (default True).
+        max_result_chars: Max characters of result text to return per field (default 200).
+        max_code_chars: Max characters of code text to return per field (default 500). Use word_live_get_field for full untruncated XML.
+        include_all_stories: If True, also scans fields in footnotes, endnotes, and headers (default False).
+        limit: Max fields to return (default 200).
+
+    Returns:
+        JSON with list of fields (index, type, type_id, char_start, char_end, code, result_preview, endnote).
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document
+        from word_document_server.utils.field_utils import get_field_type_name, parse_endnote_field_code
+
+        app = get_word_app(filename)
+        doc = find_document(app, filename)
+
+        # Collect field objects to inspect
+        field_sources = []
+        if include_all_stories:
+            try:
+                story = doc.StoryRanges(1)
+                while story is not None:
+                    field_sources.append(story.Fields)
+                    story = story.NextStoryRange
+            except Exception:
+                field_sources = [doc.Fields]
+        else:
+            field_sources = [doc.Fields]
+
+        fields = []
+        total_fields_count = 0
+        current_index = 0
+
+        ft_filter = field_type.strip().lower() if field_type else None
+        contains_filter = contains.strip().lower() if contains else None
+
+        for fld_collection in field_sources:
+            try:
+                col_count = fld_collection.Count
+                total_fields_count += col_count
+            except Exception:
+                continue
+
+            for i in range(1, col_count + 1):
+                current_index += 1
+                try:
+                    f = fld_collection(i)
+                except Exception:
+                    continue
+
+                # Safely extract properties
+                try:
+                    type_id = int(f.Type)
+                except Exception:
+                    type_id = -1
+                type_name = get_field_type_name(type_id)
+
+                code_text = ""
+                try:
+                    code_text = str(f.Code.Text) if f.Code and f.Code.Text else ""
+                except Exception as ex:
+                    code_text = f"<error reading code: {ex}>"
+
+                result_text = ""
+                try:
+                    result_text = str(f.Result.Text) if f.Result and f.Result.Text else ""
+                except Exception as ex:
+                    result_text = f"<error reading result: {ex}>"
+
+                char_start = -1
+                char_end = -1
+                try:
+                    if f.Result:
+                        char_start = f.Result.Start
+                        char_end = f.Result.End
+                except Exception:
+                    pass
+                if char_start < 0:
+                    try:
+                        if f.Code:
+                            char_start = f.Code.Start
+                            char_end = f.Code.End
+                    except Exception:
+                        pass
+
+                is_locked = False
+                try:
+                    is_locked = bool(f.Locked)
+                except Exception:
+                    pass
+
+                endnote_data = parse_endnote_field_code(code_text)
+
+                # Filter by field_type if specified
+                if ft_filter:
+                    matched_type = False
+                    if ft_filter in ("cite", "citation", "endnote"):
+                        if (endnote_data is not None and endnote_data.get("field_category") == "citation") or type_id == 1982 or "cite" in code_text.lower():
+                            matched_type = True
+                    elif ft_filter in ("bib", "bibliography", "reflist"):
+                        if (endnote_data is not None and endnote_data.get("field_category") == "bibliography") or type_id == 1983 or "reflist" in code_text.lower():
+                            matched_type = True
+                    elif ft_filter == "addin":
+                        if type_id == 26 or "addin" in type_name.lower():
+                            matched_type = True
+                    elif ft_filter in ("toc", "table of contents"):
+                        if type_id == 13 or "toc" in type_name.lower():
+                            matched_type = True
+                    elif ft_filter in ("page", "numpages"):
+                        if type_id in (32, 33) or "page" in type_name.lower():
+                            matched_type = True
+                    elif ft_filter in ("ref", "cross-reference"):
+                        if type_id == 3 or "ref" in type_name.lower():
+                            matched_type = True
+                    elif ft_filter in ("hyperlink", "link"):
+                        if type_id == 88 or "hyperlink" in type_name.lower():
+                            matched_type = True
+                    else:
+                        if ft_filter == str(type_id) or ft_filter in type_name.lower() or ft_filter in code_text.lower():
+                            matched_type = True
+
+                    if not matched_type:
+                        continue
+
+                # Filter by contains if specified
+                if contains_filter:
+                    if contains_filter not in code_text.lower() and contains_filter not in result_text.lower():
+                        continue
+
+                field_entry = {
+                    "index": current_index,
+                    "type": type_name,
+                    "type_id": type_id,
+                    "char_start": char_start,
+                    "char_end": char_end,
+                    "is_locked": is_locked,
+                }
+
+                if include_code:
+                    if len(code_text) > max_code_chars:
+                        field_entry["code"] = code_text[:max_code_chars] + f" ...[truncated {len(code_text) - max_code_chars} chars, use word_live_get_field]"
+                        field_entry["code_truncated"] = True
+                    else:
+                        field_entry["code"] = code_text
+                        field_entry["code_truncated"] = False
+
+                if include_result:
+                    if len(result_text) > max_result_chars:
+                        field_entry["result_preview"] = result_text[:max_result_chars] + " ...[truncated]"
+                    else:
+                        field_entry["result_preview"] = result_text
+
+                if endnote_data:
+                    field_entry["endnote"] = endnote_data
+
+                fields.append(field_entry)
+                if len(fields) >= limit:
+                    break
+
+            if len(fields) >= limit:
+                break
+
+        return json.dumps({
+            "success": True,
+            "document": doc.Name,
+            "total_fields": total_fields_count,
+            "matched_fields": len(fields),
+            "fields": fields,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+async def word_live_get_field(
+    filename: str = None,
+    field_index: int = None,
+    char_position: int = None,
+) -> str:
+    """[Windows only] Get a single field by index or character position, returning untruncated code and result.
+
+    Ideal for retrieving full EndNote post-annotation XML payloads (5-10 KB) without
+    truncation or loading the entire document.xml.
+
+    Args:
+        filename: Document name or path (None = active document).
+        field_index: 1-based index in Document.Fields.
+        char_position: Document character offset. Locates the field enclosing or nearest to this position.
+
+    Returns:
+        JSON with untruncated code, result, type, offsets, and complete parsed EndNote metadata.
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    if field_index is None and char_position is None:
+        return json.dumps({"error": "Either field_index or char_position must be specified"})
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document
+        from word_document_server.utils.field_utils import get_field_type_name, parse_endnote_field_code
+
+        app = get_word_app(filename)
+        doc = find_document(app, filename)
+
+        total_fields = doc.Fields.Count
+        if total_fields == 0:
+            return json.dumps({"error": f"Document '{doc.Name}' contains no fields"})
+
+        target_field = None
+        target_index = None
+
+        if field_index is not None:
+            if field_index < 1 or field_index > total_fields:
+                return json.dumps({
+                    "error": f"field_index {field_index} is out of range (document has {total_fields} fields, 1-indexed)"
+                })
+            target_field = doc.Fields(field_index)
+            target_index = field_index
+        else:
+            # Find field enclosing or closest to char_position
+            closest_dist = float("inf")
+            for i in range(1, total_fields + 1):
+                f = doc.Fields(i)
+                f_start = f.Result.Start if f.Result else (f.Code.Start if f.Code else -1)
+                f_end = f.Result.End if f.Result else (f.Code.End if f.Code else -1)
+                if f_start <= char_position <= f_end:
+                    target_field = f
+                    target_index = i
+                    break
+                dist = min(abs(char_position - f_start), abs(char_position - f_end))
+                if dist < closest_dist:
+                    closest_dist = dist
+                    target_field = f
+                    target_index = i
+
+        if target_field is None:
+            return json.dumps({"error": "Field not found"})
+
+        try:
+            type_id = int(target_field.Type)
+        except Exception:
+            type_id = -1
+        type_name = get_field_type_name(type_id)
+
+        code_text = ""
+        try:
+            code_text = str(target_field.Code.Text) if target_field.Code and target_field.Code.Text else ""
+        except Exception as ex:
+            code_text = f"<error reading code: {ex}>"
+
+        result_text = ""
+        try:
+            result_text = str(target_field.Result.Text) if target_field.Result and target_field.Result.Text else ""
+        except Exception as ex:
+            result_text = f"<error reading result: {ex}>"
+
+        char_start = -1
+        char_end = -1
+        try:
+            if target_field.Result:
+                char_start = target_field.Result.Start
+                char_end = target_field.Result.End
+        except Exception:
+            pass
+        if char_start < 0:
+            try:
+                if target_field.Code:
+                    char_start = target_field.Code.Start
+                    char_end = target_field.Code.End
+            except Exception:
+                pass
+
+        is_locked = False
+        try:
+            is_locked = bool(target_field.Locked)
+        except Exception:
+            pass
+
+        endnote_data = parse_endnote_field_code(code_text)
+
+        return json.dumps({
+            "success": True,
+            "document": doc.Name,
+            "field": {
+                "index": target_index,
+                "type": type_name,
+                "type_id": type_id,
+                "char_start": char_start,
+                "char_end": char_end,
+                "is_locked": is_locked,
+                "code": code_text,
+                "code_length": len(code_text),
+                "result": result_text,
+                "result_length": len(result_text),
+                "endnote": endnote_data,
+            }
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })
