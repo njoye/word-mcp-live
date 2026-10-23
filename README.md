@@ -6,7 +6,7 @@
 
 **The only MCP server that edits Word documents while they're open**
 
-`Live editing` &middot; `Tracked changes` &middot; `Per-action undo` &middot; `124 tools` &middot; `Cross-platform`
+`Live editing` &middot; `Tracked changes` &middot; `Per-action undo` &middot; `125 tools` &middot; `Cross-platform`
 
 [![PyPI](https://img.shields.io/pypi/v/word-mcp-live?color=blue)](https://pypi.org/project/word-mcp-live/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
@@ -56,7 +56,7 @@ https://github.com/user-attachments/assets/fbb09af4-1e25-4e49-94d0-45b363278810
 - **Threaded comments** — Add, reply, resolve, and delete comments like a human reviewer.
 - **Layout diagnostics** — Detects formatting problems before they become print disasters.
 - **Equations & cross-references** — Insert math formulas and auto-updating references.
-- **124 tools** — The most comprehensive Word MCP server available.
+- **125 tools** — The most comprehensive Word MCP server available.
 
 ## Quick Start
 

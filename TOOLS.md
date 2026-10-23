@@ -1,6 +1,6 @@
 # Tool Reference
 
-Complete list of all 115 tools provided by word-mcp-live.
+Complete list of all 125 tools provided by word-mcp-live.
 
 ---
 
@@ -190,6 +190,7 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_insert_cross_reference` | Insert a live cross-reference to headings, bookmarks, figures, tables, equations, footnotes, or endnotes |
 | `word_live_insert_equation` | Insert a mathematical equation using UnicodeMath syntax |
 | `word_live_update_field_code` | Update field instruction code (wrapped in undo record, optional recalculate) |
+| `word_live_run_macro` | Execute any Word macro, template procedure, or add-in command (e.g. EndNote `ENFormatBibliography`, Zotero `ZoteroRefresh`) |
 
 </details>
 
@@ -212,6 +213,7 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_diagnose_layout` | Scan for layout problems (keep_with_next chains, style misuse, break issues) |
 | `word_live_list_fields` | Enumerate all fields, hidden instructions, results, offsets, and parsed EndNote citations |
 | `word_live_get_field` | Get single field by index or character position with untruncated code/result |
+| `word_live_list_macros` | List callable VBA macros and add-in commands across document, templates, and add-ins |
 
 </details>
 

@@ -1499,6 +1499,26 @@ def register_tools():
 
     @mcp.tool(
         annotations=ToolAnnotations(
+            title="Word Live List Macros",
+            readOnlyHint=True,
+        ),
+        description=live_read_tools.word_live_list_macros.__doc__,
+    )
+    def word_live_list_macros(
+        filename: str = None,
+        filter: str = None,
+        source: str = "all",
+        limit: int = 100,
+    ):
+        return live_read_tools.word_live_list_macros(
+            filename=filename,
+            filter=filter,
+            source=source,
+            limit=limit,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
             title="Word Live Get Undo History",
             readOnlyHint=True,
         ),
@@ -1662,6 +1682,24 @@ def register_tools():
             field_index=field_index,
             new_code=new_code,
             update_field=update_field,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Word Live Run Macro",
+            destructiveHint=True,
+        ),
+        description=live_tools.word_live_run_macro.__doc__,
+    )
+    def word_live_run_macro(
+        macro_name: str,
+        args: list = None,
+        filename: str = None,
+    ):
+        return live_tools.word_live_run_macro(
+            macro_name=macro_name,
+            args=args,
+            filename=filename,
         )
 
     @mcp.tool(

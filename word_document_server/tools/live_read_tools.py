@@ -2019,3 +2019,69 @@ async def word_live_get_field(
             "error": str(e),
             "traceback": traceback.format_exc(),
         })
+
+
+# ---------------------------------------------------------------------------
+# Macro discovery tools
+# ---------------------------------------------------------------------------
+
+async def word_live_list_macros(
+    filename: str = None,
+    filter: str = None,
+    source: str = "all",
+    limit: int = 100,
+) -> str:
+    """[Windows only] List callable VBA macros and add-in commands in the active document, templates, and add-ins.
+
+    Discovers macros from:
+    - Active document (if macro-enabled .docm)
+    - Attached document template and global Normal.dotm
+    - Word STARTUP templates and installed Add-Ins (e.g. EndNote CWYW, Zotero)
+
+    Enables agents to discover exact macro names (such as 'ENFormatBibliography' to update
+    citations/bibliography, or 'ZoteroRefresh') before executing them with word_live_run_macro.
+    Works reliably even when 'Trust access to the VBA project object model' is disabled in Office Trust Center.
+
+    Args:
+        filename: Document name or path (None = active document).
+        filter: Optional case-insensitive substring search matching macro name, module, or template (e.g. "biblio", "citation", "endnote", "zotero").
+        source: Filter by origin: "all" (default), "document", "templates", or "addins".
+        limit: Maximum number of macros to return (default 100).
+
+    Returns:
+        JSON with list of callable macros (name, module, qualified_name, source, source_type, path).
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document
+        from word_document_server.utils.macro_utils import list_available_macros
+
+        app = None
+        doc = None
+        try:
+            app = get_word_app()
+            doc = find_document(app, filename)
+        except Exception:
+            app = None
+            doc = None
+
+        macros = list_available_macros(app, doc, query=filter, source_filter=source)
+
+        return json.dumps({
+            "success": True,
+            "document": doc.Name if doc else None,
+            "total_macros": len(macros),
+            "matched_macros": min(len(macros), limit),
+            "macros": macros[:limit],
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        import traceback
+        return json.dumps({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        })

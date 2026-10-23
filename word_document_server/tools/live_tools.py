@@ -2621,3 +2621,99 @@ async def word_live_update_field_code(
             "error": str(e),
             "traceback": traceback.format_exc(),
         })
+
+
+# ---------------------------------------------------------------------------
+# Macro execution tools
+# ---------------------------------------------------------------------------
+
+async def word_live_run_macro(
+    macro_name: str,
+    args: list = None,
+    filename: str = None,
+) -> str:
+    """[Windows only] Execute any Word macro, template procedure, or add-in command via Word's Application.Run.
+
+    Executes procedures in the active document, attached templates, Normal.dotm, or loaded add-in
+    templates (e.g. EndNote CWYW, Zotero). Automatically ensures companion add-in templates are
+    connected and active if an add-in macro is requested.
+
+    Common Examples:
+        - Format/Update EndNote Citations & Bibliography:
+          word_live_run_macro(macro_name="ENFormatBibliography")
+        - Refresh Zotero Citations & Bibliography:
+          word_live_run_macro(macro_name="ZoteroRefresh")
+        - Custom user/firm macros:
+          word_live_run_macro(macro_name="MyCustomMacro", args=["arg1", 42])
+
+    Args:
+        macro_name: Name of the macro or procedure (e.g. "ENFormatBibliography", "ZoteroRefresh", "Module1.MyMacro").
+        args: Optional list of positional arguments to pass to the macro.
+        filename: Document name or path (None = active document).
+
+    Returns:
+        JSON with execution success, macro_name, document, and return_value (if any).
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    if not macro_name or not macro_name.strip():
+        return json.dumps({"error": "macro_name must be specified"})
+
+    macro_name_clean = macro_name.strip()
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document
+        from word_document_server.utils.macro_utils import ensure_addin_template_connected
+
+        app = get_word_app()
+        doc = find_document(app, filename)
+
+        # Ensure the target document is active for the macro context
+        try:
+            doc.Activate()
+        except Exception:
+            pass
+
+        # Check and ensure companion add-in templates are connected if applicable
+        conn_info = ensure_addin_template_connected(app, macro_name_clean)
+
+        # Execute macro via Application.Run
+        pass_args = args if (args and isinstance(args, list)) else []
+        ret_val = None
+        if pass_args:
+            ret_val = app.Application.Run(macro_name_clean, *pass_args)
+        else:
+            ret_val = app.Application.Run(macro_name_clean)
+
+        # Convert return value if any to JSON-serializable representation
+        return_str = None
+        if ret_val is not None:
+            try:
+                json.dumps(ret_val)
+                return_str = ret_val
+            except Exception:
+                return_str = str(ret_val)
+
+        return json.dumps({
+            "success": True,
+            "macro_name": macro_name_clean,
+            "document": doc.Name,
+            "return_value": return_str,
+            "addin_status": conn_info,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        import traceback
+        err_msg = str(e)
+        hint = None
+        if "cannot be found" in err_msg.lower() or "not found" in err_msg.lower() or "-2147352573" in err_msg:
+            hint = f"Macro '{macro_name_clean}' was not found. Use word_live_list_macros to see available macro names."
+
+        return json.dumps({
+            "error": err_msg,
+            "hint": hint,
+            "traceback": traceback.format_exc(),
+        })
