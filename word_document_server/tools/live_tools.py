@@ -38,7 +38,7 @@ async def word_live_insert_text(
         text: Text to insert (no length limit — auto-chunked if needed).
         position: "start", "end", "cursor", or character offset as string.
         bookmark: Insert after a named bookmark (overrides position).
-        track_changes: Track the insertion as a revision.
+        track_changes: Track the insertion as a revision. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
 
     Returns:
         JSON with result info.
@@ -185,7 +185,7 @@ async def word_live_format_text(
         preserve_direct_formatting: When True and style_name is set, saves font/size/bold/italic/
             alignment/spacing before applying the style and restores them after. Useful for changing
             a paragraph's style (e.g., Heading 5 → Normal) without losing its visual formatting.
-        track_changes: Track formatting changes as revisions.
+        track_changes: Track formatting changes as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
 
     Returns:
         JSON with result info.
@@ -374,7 +374,7 @@ async def word_live_apply_list(
                Mac-only: when keys are heading texts, matching is case-insensitive with
                apostrophe/whitespace normalization and supports startsWith fallback.
             Paragraphs not in the map stay at level 1 (or value of `level + 1`).
-        track_changes: Track changes as revisions.
+        track_changes: Track changes as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
         font_color: (Mac multilevel only) Override font color on list-formatted paragraphs.
             Hex string like "#0D0D0D". Applied after list formatting to override Word's
             blue heading defaults when list templates link to heading styles.
@@ -924,9 +924,11 @@ async def word_live_replace_text(
 ) -> str:
     """[Windows only] Find and replace text in an open Word document.
 
+    Supports search and replacement strings of arbitrary length (automatically handles Word's
+    255-character limit via chunked prefix matching and direct Range text assignment).
     Uses Word's native Find & Replace, which works across tracked change boundaries
     (unlike manual delete+insert). Supports Word special characters when use_wildcards=True:
-    ^m (manual page break), ^t (tab), ^p (paragraph mark), ^s (non-breaking space), and Word wildcard syntax.
+    ^m (manual page break), ^t (tab), ^p (paragraph mark), ^s (non-breaking space), and Word wildcard syntax (patterns up to 255 chars).
 
     Args:
         filename: Document name or path (None = active document).
@@ -936,7 +938,7 @@ async def word_live_replace_text(
         match_whole_word: Match whole words only (ignored when use_wildcards=True).
         use_wildcards: Enable Word wildcards and special characters.
         replace_all: Replace all occurrences (True) or just the first one (False).
-        track_changes: Track replacements as revisions.
+        track_changes: Track replacements as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False). Note: replace_all=True with track_changes=True causes an infinite loop in Word COM, so use replace_all=False when tracking changes.
 
     Returns:
         JSON with count of replacements made.
@@ -951,15 +953,9 @@ async def word_live_replace_text(
     if not find_text:
         return json.dumps({"error": "find_text is required"})
 
-    if len(find_text) > 255:
+    if use_wildcards and len(find_text) > 255:
         return json.dumps({
-            "error": f"find_text is {len(find_text)} chars (Word limit: 255). "
-            "Break into smaller find/replace pairs."
-        })
-    if len(replace_text) > 255:
-        return json.dumps({
-            "error": f"replace_text is {len(replace_text)} chars (Word limit: 255). "
-            "Break into smaller find/replace pairs."
+            "error": f"use_wildcards=True does not support find patterns longer than 255 characters (Word limitation: {len(find_text)} chars). Use use_wildcards=False for literal text replacement of arbitrary length."
         })
 
     # Reject control bytes (notably \x07 cell separator) that can corrupt
@@ -980,6 +976,12 @@ async def word_live_replace_text(
 
     try:
         from word_document_server.core.word_com import get_word_app, find_document, undo_record
+        from word_document_server.utils.find_utils import (
+            prepare_find_prefix,
+            calculate_word_char_length,
+            is_text_match,
+            is_whole_word_boundary,
+        )
 
         app = get_word_app()
         doc = find_document(app, filename)
@@ -1002,32 +1004,97 @@ async def word_live_replace_text(
                 rng = doc.Content.Duplicate
                 rng.Find.ClearFormatting()
 
+                is_long = len(find_text) > 255
+                if is_long:
+                    prefix = prepare_find_prefix(find_text, 200)
+                    word_char_len = calculate_word_char_length(find_text)
+                else:
+                    prefix = find_text
+                    word_char_len = len(find_text)
+
+                last_start = -1
+                # Convert Word special characters to actual characters for rng.Text assignment
+                # (rng.Text doesn't interpret ^p/^t/^m like Find.Execute Replace does)
+                processed = replace_text.replace("^p", "\r").replace("^t", "\t").replace("^m", "\x0c").replace("^s", "\u00a0")
+
                 while True:
                     found = rng.Find.Execute(
-                        FindText=find_text,
+                        FindText=prefix,
                         MatchCase=match_case,
-                        MatchWholeWord=match_whole_word if not use_wildcards else False,
+                        MatchWholeWord=match_whole_word if (not use_wildcards and not is_long) else False,
                         MatchWildcards=use_wildcards,
                         Forward=True,
                         Wrap=0,  # wdFindStop
                     )
                     if not found:
                         break
-                    # Guard: zero-length match → skip forward 1 char to avoid infinite loop
-                    if rng.Start == rng.End:
-                        rng.Start = rng.Start + 1
-                        rng.End = doc.Content.End
+
+                    found_start = rng.Start
+                    found_end = rng.End
+
+                    # Guard against repeating the same match position
+                    if found_start <= last_start:
+                        skip_pos = last_start + 1
+                        rng.SetRange(skip_pos, skip_pos)
                         continue
-                    # Convert Word special characters to actual characters for rng.Text assignment
-                    # (rng.Text doesn't interpret ^p/^t/^m like Find.Execute Replace does)
-                    processed = replace_text.replace("^p", "\r").replace("^t", "\t").replace("^m", "\x0c").replace("^s", "\u00a0")
-                    rng.Text = processed
+
+                    doc_end = doc.Content.End
+
+                    if is_long:
+                        match_end_candidate = min(doc_end, found_start + word_char_len)
+                        try:
+                            verify_rng = doc.Range(found_start, match_end_candidate)
+                            actual_text = verify_rng.Text
+                        except Exception:
+                            actual_text = ""
+
+                        if not is_text_match(actual_text, find_text, match_case=match_case):
+                            last_start = found_start
+                            skip_pos = found_start + 1
+                            rng.SetRange(skip_pos, skip_pos)
+                            continue
+
+                        if match_whole_word:
+                            char_before = None
+                            char_after = None
+                            if found_start > 0:
+                                try:
+                                    char_before = doc.Range(found_start - 1, found_start).Text
+                                except Exception:
+                                    pass
+                            if match_end_candidate < doc_end:
+                                try:
+                                    char_after = doc.Range(match_end_candidate, match_end_candidate + 1).Text
+                                except Exception:
+                                    pass
+                            if not is_whole_word_boundary(char_before, char_after):
+                                last_start = found_start
+                                skip_pos = found_start + 1
+                                rng.SetRange(skip_pos, skip_pos)
+                                continue
+
+                        target_rng = verify_rng
+                        target_start = found_start
+                    else:
+                        # Guard: zero-length match → skip forward 1 char to avoid infinite loop
+                        if found_start == found_end:
+                            skip_pos = found_start + 1
+                            rng.SetRange(skip_pos, skip_pos)
+                            continue
+                        target_rng = rng
+                        target_start = found_start
+
+                    target_rng.Text = processed
                     count += 1
+                    last_start = target_start
+
                     if not replace_all:
                         break
                     if count >= MAX_REPLACEMENTS:
                         break
-                    rng.Collapse(0)  # wdCollapseEnd — move past replacement
+
+                    next_pos = target_rng.End if target_rng.End > target_start else target_start + 1
+                    rng.SetRange(next_pos, next_pos)
             finally:
                 doc.TrackRevisions = prev_tracking
                 if track_changes:
@@ -1068,7 +1135,7 @@ async def word_live_insert_paragraphs(
         target_paragraph_index: 0-based paragraph index (as returned by word_live_get_text).
         position: 'before' or 'after' the target paragraph (default 'after').
         style: Style name for inserted paragraphs. None = "Normal" (avoids inheriting heading styles).
-        track_changes: Track insertions as revisions.
+        track_changes: Track insertions as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
 
     Returns:
         JSON with result info including count of paragraphs inserted.
@@ -1196,7 +1263,7 @@ async def word_live_add_table(
             Use None or "" for no style.
         autofit: "window" (fit page width, default), "content" (fit cell content),
             "fixed" (fixed widths), or None for legacy behavior (no autofit).
-        track_changes: Track as revision.
+        track_changes: Track as revision. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
 
     Returns:
         JSON with result info.
@@ -1514,7 +1581,7 @@ async def word_live_delete_text(
         filename: Document name or path.
         start: Start character position.
         end: End character position.
-        track_changes: Track deletion as a revision.
+        track_changes: Track deletion as a revision. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
 
     Returns:
         JSON with deleted text info.
@@ -1626,7 +1693,7 @@ async def word_live_modify_table(
         autofit_mode: 'content', 'window', or 'fixed' (autofit operation).
         accept_revisions: For set_cell/set_row/set_range — accept tracked changes before writing
             (prevents layered text from old revisions persisting underneath new content).
-        track_changes: Track modifications as revisions.
+        track_changes: Track modifications as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False).
         scrub_orphans: For delete_table — scan the deletion site for orphan
             cell-separator (\\x07) bytes and remove them. Default True.
 

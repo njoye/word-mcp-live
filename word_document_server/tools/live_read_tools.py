@@ -534,8 +534,9 @@ async def word_live_find_text(
 ) -> str:
     """Find text in an open Word document.
 
-    Supports Word special characters when use_wildcards=True:
-    ^m (manual page break), ^t (tab), ^p (paragraph mark), ^s (non-breaking space), and Word wildcard syntax.
+    Supports search strings of arbitrary length (automatically handles Word's 255-character
+    limit via chunked prefix matching). Supports Word special characters when use_wildcards=True:
+    ^m (manual page break), ^t (tab), ^p (paragraph mark), ^s (non-breaking space), and Word wildcard syntax (patterns up to 255 chars).
     Note: whole_word is ignored when use_wildcards is True (Word limitation).
 
     Args:
@@ -568,8 +569,19 @@ async def word_live_find_text(
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
+    if use_wildcards and len(search_text) > 255:
+        return json.dumps({
+            "error": f"use_wildcards=True does not support search patterns longer than 255 characters (Word limitation: {len(search_text)} chars). Use use_wildcards=False for literal text search of arbitrary length."
+        })
+
     try:
         from word_document_server.core.word_com import get_word_app, find_document
+        from word_document_server.utils.find_utils import (
+            prepare_find_prefix,
+            calculate_word_char_length,
+            is_text_match,
+            is_whole_word_boundary,
+        )
 
         app = get_word_app()
         doc = find_document(app, filename)
@@ -588,12 +600,22 @@ async def word_live_find_text(
         rng = doc.Content.Duplicate
         rng.Find.ClearFormatting()
 
+        is_long = len(search_text) > 255
+        if is_long:
+            prefix = prepare_find_prefix(search_text, 200)
+            word_char_len = calculate_word_char_length(search_text)
+        else:
+            prefix = search_text
+            word_char_len = len(search_text)
+
+        last_start = -1
+
         while len(matches) < max_results:
             try:
                 found = rng.Find.Execute(
-                    FindText=search_text,
+                    FindText=prefix,
                     MatchCase=match_case,
-                    MatchWholeWord=whole_word if not use_wildcards else False,
+                    MatchWholeWord=whole_word if (not use_wildcards and not is_long) else False,
                     MatchWildcards=use_wildcards,
                     Forward=True,
                     Wrap=0,  # wdFindStop
@@ -604,14 +626,76 @@ async def word_live_find_text(
             if not found:
                 break
 
-            match_start = _safe_attr(rng, "Start", -1)
-            match_end = _safe_attr(rng, "End", -1)
+            found_start = _safe_attr(rng, "Start", -1)
+            found_end = _safe_attr(rng, "End", -1)
+            if found_start < 0 or found_end < 0:
+                break
 
+            # Guard against repeating the same match position
+            if found_start <= last_start:
+                try:
+                    skip_pos = last_start + 1
+                    rng.SetRange(skip_pos, skip_pos)
+                except Exception:
+                    break
+                continue
+
+            doc_end = _safe_attr(doc.Content, "End", found_start + word_char_len)
+
+            if is_long:
+                # Verify the full string at found_start
+                match_end_candidate = min(doc_end, found_start + word_char_len)
+                try:
+                    verify_rng = doc.Range(found_start, match_end_candidate)
+                    actual_text = _safe_attr(verify_rng, "Text", "")
+                except Exception:
+                    actual_text = ""
+
+                if not is_text_match(actual_text, search_text, match_case=match_case):
+                    # False positive prefix match: advance past found_start
+                    last_start = found_start
+                    try:
+                        skip_pos = found_start + 1
+                        rng.SetRange(skip_pos, skip_pos)
+                    except Exception:
+                        break
+                    continue
+
+                if whole_word:
+                    char_before = None
+                    char_after = None
+                    if found_start > 0:
+                        try:
+                            char_before = doc.Range(found_start - 1, found_start).Text
+                        except Exception:
+                            pass
+                    if match_end_candidate < doc_end:
+                        try:
+                            char_after = doc.Range(match_end_candidate, match_end_candidate + 1).Text
+                        except Exception:
+                            pass
+                    if not is_whole_word_boundary(char_before, char_after):
+                        last_start = found_start
+                        try:
+                            skip_pos = found_start + 1
+                            rng.SetRange(skip_pos, skip_pos)
+                        except Exception:
+                            break
+                        continue
+
+                match_start = found_start
+                match_end = match_end_candidate
+                match_display_text = actual_text
+            else:
+                match_start = found_start
+                match_end = found_end
+                match_display_text = _safe_attr(rng, "Text", "<unreadable>")
+
+            # Extract context
             try:
                 context_rng = rng.Duplicate
-                content_end = _safe_attr(doc.Content, "End", match_end)
                 context_start = max(0, match_start - context_chars) if match_start >= 0 else 0
-                context_end = min(content_end, match_end + context_chars) if match_end >= 0 else context_chars
+                context_end = min(doc_end, match_end + context_chars) if match_end >= 0 else context_chars
                 context_rng.SetRange(context_start, context_end)
                 context_text = _safe_attr(context_rng, "Text", "<unreadable>")
             except Exception as e:
@@ -620,13 +704,16 @@ async def word_live_find_text(
             matches.append({
                 "start": match_start,
                 "end": match_end,
-                "text": _safe_attr(rng, "Text", "<unreadable>"),
+                "text": match_display_text,
                 "context": context_text,
             })
 
-            # Move past current match — guard against transient COM failures
+            last_start = match_start
+
+            # Move past current match
             try:
-                rng.SetRange(match_end if match_end >= 0 else rng.End, doc.Content.End)
+                adv_pos = match_end if match_end > match_start else match_start + 1
+                rng.SetRange(adv_pos, adv_pos)
             except Exception as e:
                 partial_errors.append(f"advance past match failed: {e}")
                 break

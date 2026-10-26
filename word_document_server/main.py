@@ -915,6 +915,7 @@ def register_tools():
             title="Word Live Insert Text",
             destructiveHint=True,
         ),
+        description=live_tools.word_live_insert_text.__doc__,
     )
     def word_live_insert_text(
         filename: str = None,
@@ -1012,6 +1013,7 @@ def register_tools():
             title="Word Live Add Table",
             destructiveHint=True,
         ),
+        description=live_tools.word_live_add_table.__doc__,
     )
     def word_live_add_table(
         filename: str = None,
@@ -1092,6 +1094,7 @@ def register_tools():
             title="Word Live Delete Text",
             destructiveHint=True,
         ),
+        description=live_tools.word_live_delete_text.__doc__,
     )
     def word_live_delete_text(
         filename: str = None,

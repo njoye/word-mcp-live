@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.22] - 2026-10-26
+
+### Added
+- **Arbitrary length search and replacement in `word_live_find_text` and `word_live_replace_text`** — transparently bypasses Microsoft Word's 255-character `Find.Execute` COM parameter limit via chunked prefix matching and direct Word `Range` text assignment. Search strings can now be 500, 1,000, or more characters (e.g. full paragraphs or multi-sentence blocks).
+- New utility module `word_document_server/utils/find_utils.py` — handles safe prefix chunking, newline normalization (`\r\n` vs Word's `\r`), string verification, and word boundary checks.
+- Comprehensive test suite in `tests/test_find_utils.py` and `tests/test_live_find_replace_long.py` (29 new tests) covering edge cases (exact 255 chars, 256 chars, 500 chars, 1,000+ chars, false-positive prefix rejection, case sensitivity, whole word boundaries, deletions, replacements across paragraph newlines).
+- **Tracked changes requirement for modification tools** — updated docstrings and schemas for all live modification tools (`word_live_replace_text`, `word_live_insert_text`, `word_live_format_text`, `word_live_delete_text`, `word_live_modify_table`, `word_live_add_table`, `word_live_apply_list`, `word_live_insert_paragraphs`) explicitly instructing agents to use `track_changes=True` unless granted permission for untracked edits.
+
+### Fixed
+- **`word_live_find_text` duplicate match bug** — previously advanced search via `rng.SetRange(match_end, doc.Content.End)` which caused Word's `Find` object to lose its search pointer and re-match the exact same position up to `max_results` (50) times. Now cleanly advances the collapsed insertion point via `rng.SetRange(adv_pos, adv_pos)` with position-regression guards.
+
 ## [1.6.0] - 2026-04-29
 
 ### Added
