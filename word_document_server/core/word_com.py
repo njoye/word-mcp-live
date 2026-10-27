@@ -20,9 +20,9 @@ def _get_app_from_file(filename: str):
         if os.path.isabs(filename):
             candidates.append(filename)
         else:
-            candidates.append(os.path.abspath(filename))
             user_docs = os.path.join(os.path.expanduser('~'), 'Documents', filename)
             candidates.append(user_docs)
+            candidates.append(os.path.abspath(filename))
             candidates.append(filename)
 
         for path in candidates:
@@ -179,7 +179,18 @@ def find_document(app, filename: str = None):
         raise ValueError("No documents are open in Word")
 
     if not filename:
-        return app.ActiveDocument
+        active_doc = app.ActiveDocument
+        if app.Documents.Count > 1:
+            try:
+                print(
+                    f"[Word COM Warning] Multiple documents open ({app.Documents.Count}). "
+                    f"Targeting active document '{active_doc.Name}'. "
+                    f"Specify 'filename' explicitly to prevent accidental mis-targeting.",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+        return active_doc
 
     target_basename = unicodedata.normalize('NFC', os.path.basename(filename)).lower()
     target_fullpath = (
@@ -238,3 +249,100 @@ def undo_record(app, name: str):
                 rec.EndCustomRecord()
             except Exception:
                 pass
+
+
+def get_document_target_warning(app, filename: str = None) -> str:
+    """Return a warning string if filename was omitted while multiple documents are open."""
+    if not filename:
+        try:
+            count = app.Documents.Count
+            if count > 1:
+                active_name = app.ActiveDocument.Name
+                return (
+                    f"Multiple documents open in Word ({count}). 'filename' was not specified; "
+                    f"targeted active document '{active_name}'. Pass 'filename' explicitly to prevent targeting the wrong document."
+                )
+        except Exception:
+            pass
+    return None
+
+
+class AsyncRLock:
+    """Re-entrant asyncio lock for serializing Word COM calls across Word's Single-Threaded Apartment (STA)."""
+
+    def __init__(self):
+        self._lock = None
+        self._owner = None
+        self._count = 0
+
+    def _get_lock(self):
+        if self._lock is None:
+            import asyncio
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def acquire(self):
+        import asyncio
+        me = asyncio.current_task()
+        if self._owner == me:
+            self._count += 1
+            return True
+        await self._get_lock().acquire()
+        self._owner = me
+        self._count = 1
+        return True
+
+    def release(self):
+        import asyncio
+        me = asyncio.current_task()
+        if self._owner != me:
+            raise RuntimeError("Cannot release un-acquired lock")
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+            self._get_lock().release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.release()
+
+
+_WORD_COM_LOCK = AsyncRLock()
+
+
+def serialize_word_com(func):
+    """Decorator to serialize async COM tool calls across Word's Single-Threaded Apartment (STA)
+    and retry transient RPC_E_CALL_REJECTED (-2147418111) errors."""
+    import functools
+    import asyncio
+    import inspect
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with _WORD_COM_LOCK:
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if inspect.iscoroutinefunction(func):
+                        return await func(*args, **kwargs)
+                    res = func(*args, **kwargs)
+                    if asyncio.iscoroutine(res):
+                        return await res
+                    return res
+                except Exception as e:
+                    err_str = str(e)
+                    is_rejected = (
+                        "-2147418111" in err_str
+                        or "0x80010001" in err_str
+                        or "rejected by callee" in err_str.lower()
+                    )
+                    if is_rejected and attempt < max_retries - 1:
+                        await asyncio.sleep(0.15 * (attempt + 1))
+                        continue
+                    raise
+
+    return wrapper
+

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-10-26
+
+### Added
+- **Stable Comment IDs & Target Echo (Phase 1)**:
+  - Generates deterministic 12-hex IDs (`comment_id`, e.g. `c_a1b2c3d4e5f6`) based on creation timestamp, author, and range start in `word_live_get_comments` and `word_live_add_comment`.
+  - Added `comment_id` resolution support to `word_live_reply_to_comment`, `word_live_resolve_comment`, and `word_live_delete_comment`, with backward-compatible fallback to `comment_index`.
+  - Added operation echo payload returning target comment details (`replied_to`, `resolved_comment`, `deleted_comment` with author and text excerpt) and index shift warnings to prevent off-by-one errors after deletions or additions.
+- **Docstring Conventions & Invariant Contracts (Phase 2)**:
+  - Added standardized `CONVENTIONS & INVARIANTS` sections across `word_live_get_text`, `word_live_find_text`, `word_live_replace_text`, `word_live_insert_text`, `word_live_format_text`, `word_live_delete_text`, `word_live_insert_paragraphs`, and comment tools.
+  - Documents 0-based character offsets vs 1-based paragraph indices, offset invalidation behavior during edits, and strict tracked changes permission policies.
+- **Figure Inventory & In-Place Replacement (Phase 4)**:
+  - Added `word_live_list_inline_shapes` tool returning complete figure inventory: dimensions (pt/inches), type classification (`inline_picture`, `linked_picture`, `chart`, `embedded_ole`), link target paths, paragraph indices, and page numbers.
+  - Added `word_live_replace_inline_image` tool supporting in-place figure swapping with automatic dimension preservation (`keep_size=True`), linked vs embedded picture handling, undo grouping, and tracked revision logging.
+- **Find Coordinate Bridge & Span Deduplication (Phase 5)**:
+  - Enhanced `word_live_find_text` matches to include 1-based `paragraph_index` (derived via `doc.Range(0, start).Paragraphs.Count`) and `page` number (`wdActiveEndAdjustedPageNumber`).
+  - Added `(start, end)` span deduplication in `word_live_find_text` to prevent duplicate match reports from overlapping ranges or repeated COM hits.
+- **Per-Occurrence & Offset-Bounded Replacement (Phase 6)**:
+  - Extended `word_live_replace_text` with `occurrence: int` (1-based instance target) and `start_after: int` (0-based starting offset).
+  - Enforces `replace_all=False` when targeting a specific occurrence, records exact replaced character spans, and raises descriptive errors if the requested occurrence exceeds match counts.
+- **`replace_all` / `track_changes` Smart Defaults**:
+  - `word_live_replace_text` now smartly defaults `replace_all = False` when `track_changes=True` or when `start_after` is specified, eliminating agent friction and preventing infinite loop guard failures while maintaining safe single-replacement behavior.
+- **Word COM STA Serialization & Auto-Retry**:
+  - Implemented `@serialize_word_com` decorator powered by `AsyncRLock` across all 51 live Word COM tools (`word_live_*`), automatically serializing concurrent async calls across Word's Single-Threaded Apartment (STA) and retrying transient `RPC_E_CALL_REJECTED` (`0x80010001` / `-2147418111`) errors with exponential backoff.
+- **Multi-Document Target Warning & Focus Safety**:
+  - Added `get_document_target_warning` and stderr warnings when multiple documents are open in Word and `filename` is omitted. Responses now return a `"target_warning"` field identifying the targeted frontmost document and advising callers to specify `filename` explicitly to prevent mis-targeting when active focus changes.
+
+### Fixed
+- **D0 (Regression)**: Fixed `TypeError: word_live_replace_text() got multiple values for argument 'occurrence'` in server tool adapter by passing all arguments via keyword.
+- **D2 (High)**: Fixed `word_live_replace_inline_image` duplicating figures instead of replacing in-place by calling `old_shape.Delete()` after `AddPicture`, ensuring paired tracked deletion/insertion revisions, correct paragraph positioning, and added `force_embed` parameter.
+- **D1, D3, D6 (High/Medium/Low)**: Resolved comment ID collision and reply double-counting by filtering out threaded replies (`c.Ancestor is not None`) from top-level comment listings in `word_live_get_comments`, formatting reply IDs deterministically as `<parent_id>_r<index>`, and returning distinct `reply_comment_id` in `word_live_reply_to_comment`.
+- **D4 (Medium)**: Fixed raw COM tuple error when deleting comments with replies by executing `DeleteRecursively()` when replies exist, exposing `delete_recursively: bool = True`, and cleanly catching COM errors.
+- **D5 (Medium-High)**: Fixed off-by-one paragraph index attribution in `word_live_find_text`, `word_live_list_inline_shapes`, and `word_live_replace_inline_image` when a match begins on a paragraph's initial character by evaluating `doc.Range(0, min(doc_end, start + 1)).Paragraphs.Count`.
+- **D7 (Low)**: Added explicit index base definitions and field-code offset inflation documentation to `word_live_get_text` and `word_live_get_page_text`.
+
 ## [1.6.22] - 2026-10-26
 
 ### Added

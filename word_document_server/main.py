@@ -979,12 +979,22 @@ def register_tools():
         match_case: bool = False,
         match_whole_word: bool = False,
         use_wildcards: bool = False,
-        replace_all: bool = True,
+        replace_all: bool = None,
+        occurrence: int = None,
+        start_after: int = None,
         track_changes: bool = False,
     ):
         return live_tools.word_live_replace_text(
-            filename, find_text, replace_text, match_case,
-            match_whole_word, use_wildcards, replace_all, track_changes,
+            filename=filename,
+            find_text=find_text,
+            replace_text=replace_text,
+            match_case=match_case,
+            match_whole_word=match_whole_word,
+            use_wildcards=use_wildcards,
+            replace_all=replace_all,
+            occurrence=occurrence,
+            start_after=start_after,
+            track_changes=track_changes,
         )
 
     @mcp.tool(
@@ -1313,9 +1323,9 @@ def register_tools():
             title="Word Live Get Comments",
             readOnlyHint=True,
         ),
+        description=live_read_tools.word_live_get_comments.__doc__,
     )
     def word_live_get_comments(filename: str = None):
-        """[Windows only] Get all comments from a Word document open in Word. Requires Word running."""
         return live_read_tools.word_live_get_comments(filename)
 
     @mcp.tool(
@@ -1323,6 +1333,7 @@ def register_tools():
             title="Word Live Add Comment",
             destructiveHint=True,
         ),
+        description=live_read_tools.word_live_add_comment.__doc__,
     )
     def word_live_add_comment(
         filename: str = None,
@@ -1332,8 +1343,6 @@ def register_tools():
         text: str = "",
         author: str = DEFAULT_AUTHOR,
     ):
-        """[Windows only] Add a comment to a Word document open in Word.
-        Specify start/end character positions or paragraph_index (1-indexed). Requires Word running."""
         return live_read_tools.word_live_add_comment(
             filename, start, end, paragraph_index, text, author
         )
@@ -1343,18 +1352,17 @@ def register_tools():
             title="Word Live Reply to Comment",
             destructiveHint=True,
         ),
+        description=live_read_tools.word_live_reply_to_comment.__doc__,
     )
     def word_live_reply_to_comment(
         filename: str = None,
+        comment_id: str = None,
         comment_index: int = None,
         text: str = "",
         author: str = DEFAULT_AUTHOR,
     ):
-        """[Windows only] Reply to an existing comment in a Word document open in Word.
-        Adds a threaded reply. Use word_live_get_comments to find the comment_index.
-        Requires Word 2016+ running."""
         return live_read_tools.word_live_reply_to_comment(
-            filename, comment_index, text, author
+            filename, comment_id, comment_index, text, author
         )
 
     @mcp.tool(
@@ -1362,17 +1370,16 @@ def register_tools():
             title="Word Live Resolve Comment",
             destructiveHint=True,
         ),
+        description=live_read_tools.word_live_resolve_comment.__doc__,
     )
     def word_live_resolve_comment(
         filename: str = None,
+        comment_id: str = None,
         comment_index: int = None,
         resolve: bool = True,
     ):
-        """[Windows only] Resolve or unresolve a comment in a Word document open in Word.
-        Sets the comment's Done property. Use word_live_get_comments to find comment_index.
-        Requires Word 2016+ running."""
         return live_read_tools.word_live_resolve_comment(
-            filename, comment_index, resolve
+            filename, comment_id, comment_index, resolve
         )
 
     @mcp.tool(
@@ -1380,16 +1387,19 @@ def register_tools():
             title="Word Live Delete Comment",
             destructiveHint=True,
         ),
+        description=live_read_tools.word_live_delete_comment.__doc__,
     )
     def word_live_delete_comment(
         filename: str = None,
+        comment_id: str = None,
         comment_index: int = None,
+        delete_recursively: bool = True,
     ):
-        """[Windows only] Delete a comment from a Word document open in Word.
-        Permanently removes the comment. Use word_live_get_comments to find comment_index.
-        Requires Word running."""
         return live_read_tools.word_live_delete_comment(
-            filename, comment_index
+            filename=filename,
+            comment_id=comment_id,
+            comment_index=comment_index,
+            delete_recursively=delete_recursively,
         )
 
     @mcp.tool(
@@ -1601,6 +1611,40 @@ def register_tools():
             width_inches, height_inches, width_pt, height_pt,
             alignment, wrapping, border_style, border_width_pt,
             border_color, link_to_file
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Word Live List Inline Shapes",
+            readOnlyHint=True,
+        ),
+        description=live_read_tools.word_live_list_inline_shapes.__doc__,
+    )
+    def word_live_list_inline_shapes(filename: str = None):
+        return live_read_tools.word_live_list_inline_shapes(filename)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            title="Word Live Replace Inline Image",
+            destructiveHint=True,
+        ),
+        description=live_tools.word_live_replace_inline_image.__doc__,
+    )
+    def word_live_replace_inline_image(
+        filename: str = None,
+        shape_index: int = 1,
+        image_path: str = "",
+        keep_size: bool = True,
+        force_embed: bool = False,
+        track_changes: bool = True,
+    ):
+        return live_tools.word_live_replace_inline_image(
+            filename=filename,
+            shape_index=shape_index,
+            image_path=image_path,
+            keep_size=keep_size,
+            force_embed=force_embed,
+            track_changes=track_changes,
         )
 
     @mcp.tool(

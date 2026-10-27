@@ -11,8 +11,23 @@ import time
 from difflib import SequenceMatcher
 
 from word_document_server.defaults import DEFAULT_AUTHOR
+from word_document_server.utils.comment_utils import (
+    generate_comment_id,
+    extract_comment_excerpt,
+    resolve_comment,
+)
+from word_document_server.core.word_com import serialize_word_com, get_document_target_warning
 # macOS JXA dispatch
 _MAC_AVAILABLE = __import__('sys').platform == 'darwin'
+
+
+def _safe_attr(obj, attr, default=None):
+    """Safely get an attribute from a COM object without raising COM marshalling errors."""
+    try:
+        val = getattr(obj, attr)
+        return val if val is not None else default
+    except Exception:
+        return default
 
 
 
@@ -55,6 +70,7 @@ def _get_snapshot(doc) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+@serialize_word_com
 async def word_live_take_snapshot(filename: str = None) -> str:
     """[Windows only] Store a snapshot of the current document text for later diffing.
 
@@ -100,6 +116,7 @@ async def word_live_take_snapshot(filename: str = None) -> str:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_diff(filename: str = None) -> str:
     """[Windows only] Return only the paragraphs that changed since the last snapshot.
 
@@ -201,6 +218,7 @@ async def word_live_get_diff(filename: str = None) -> str:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_snapshot_status(filename: str = None) -> str:
     """[Windows only] Check whether a snapshot exists for the document and how old it is.
 
@@ -244,8 +262,16 @@ async def word_live_snapshot_status(filename: str = None) -> str:
 # ---------------------------------------------------------------------------
 
 
+@serialize_word_com
 async def word_live_get_text(filename: str = None) -> str:
     """Get all text from an open Word document, paragraph by paragraph.
+
+    CONVENTIONS & INVARIANTS:
+    - Index bases: Paragraph indices are 1-based (word_live_get_text, word_live_format_text, word_live_add_comment). Character offsets (start, end) are 0-based.
+    - Coordinate Systems: Use paragraph indices for structural/block tools, character offsets for surgical range tools.
+    - Field-Code Offset Inflation: In documents containing dynamic fields (e.g., EndNote citations, HYPERLINK, SEQ codes),
+      character offsets include underlying hidden field-code instruction strings. Character spans and end offsets
+      may appear significantly larger than the visible text character count.
 
     For documents with more than 200 paragraphs, only the first 3 pages are
     returned along with total page count. Use word_live_get_page_text to read
@@ -314,6 +340,7 @@ async def word_live_get_text(filename: str = None) -> str:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_paragraph_format(
     filename: str = None,
     start_paragraph: int = None,
@@ -465,6 +492,7 @@ async def word_live_get_paragraph_format(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_info(filename: str = None) -> str:
     """Get document info from an open Word document.
 
@@ -523,6 +551,7 @@ async def word_live_get_info(filename: str = None) -> str:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_find_text(
     filename: str = None,
     search_text: str = "",
@@ -533,6 +562,13 @@ async def word_live_find_text(
     max_results: int = 50,
 ) -> str:
     """Find text in an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Index bases: Character offsets (start, end) are 0-based. paragraph_index is 1-based (directly usable in word_live_format_text, word_live_insert_paragraphs).
+    - Anchor guidance: Use at least one full unique sentence as the find anchor; check match_count == 1 before replacing. Short anchors hit multiple locations.
+    - Wildcard escapes: ^p (paragraph mark), ^t (tab), ^m (page break), ^s (non-breaking space).
+    - Coordinate Bridge: Each match includes 'paragraph_index' (1-based) and 'page' for seamless piping to other live tools.
+    - Deduplication: Matches are strictly deduplicated by (start, end) character spans.
 
     Supports search strings of arbitrary length (automatically handles Word's 255-character
     limit via chunked prefix matching). Supports Word special characters when use_wildcards=True:
@@ -586,16 +622,8 @@ async def word_live_find_text(
         app = get_word_app()
         doc = find_document(app, filename)
 
-        # COM-marshalling can fail intermittently after MCP reconnect on
-        # property access (rng.Text, doc.Name). Wrap each access so a
-        # single hiccup yields a partial result rather than aborting.
-        def _safe_attr(obj, attr, default=None):
-            try:
-                return getattr(obj, attr)
-            except Exception:
-                return default
-
         matches = []
+        seen_spans = set()
         partial_errors = []
         rng = doc.Content.Duplicate
         rng.Find.ClearFormatting()
@@ -691,6 +719,34 @@ async def word_live_find_text(
                 match_end = found_end
                 match_display_text = _safe_attr(rng, "Text", "<unreadable>")
 
+            # Server-side span deduplication (F5)
+            span_key = (match_start, match_end)
+            if span_key in seen_spans:
+                last_start = match_start
+                try:
+                    adv_pos = match_end if match_end > match_start else match_start + 1
+                    rng.SetRange(adv_pos, adv_pos)
+                except Exception:
+                    break
+                continue
+            seen_spans.add(span_key)
+
+            para_idx = None
+            try:
+                limit_pos = match_start + 1
+                if isinstance(doc_end, (int, float)):
+                    limit_pos = min(int(doc_end), limit_pos)
+                para_idx = doc.Range(0, limit_pos).Paragraphs.Count
+            except Exception:
+                pass
+
+            page_num = None
+            try:
+                # wdActiveEndAdjustedPageNumber = 3
+                page_num = rng.Information(3)
+            except Exception:
+                pass
+
             # Extract context
             try:
                 context_rng = rng.Duplicate
@@ -701,12 +757,18 @@ async def word_live_find_text(
             except Exception as e:
                 context_text = f"<context unavailable: {e}>"
 
-            matches.append({
+            match_data = {
                 "start": match_start,
                 "end": match_end,
                 "text": match_display_text,
                 "context": context_text,
-            })
+            }
+            if para_idx is not None:
+                match_data["paragraph_index"] = para_idx
+            if page_num is not None:
+                match_data["page"] = page_num
+
+            matches.append(match_data)
 
             last_start = match_start
 
@@ -727,20 +789,29 @@ async def word_live_find_text(
         }
         if partial_errors:
             result["partial_errors"] = partial_errors
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            result["target_warning"] = target_warning
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_comments(filename: str = None) -> str:
     """Get all comments from an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Stable IDs: Each comment and reply includes a stable 'comment_id' (e.g. 'c_a8f3b9012e4c')
+      derived from creation timestamp and author metadata. Prefer comment_id over comment_index.
+    - Index Shift Rule: Adding a reply shifts all subsequent comments by +1. Deleting shifts by -1.
 
     Args:
         filename: Document name or path (None = active document).
 
     Returns:
-        JSON with list of comments (author, date, text, scope).
+        JSON with list of comments (comment_id, index, author, date, text, scope, replies).
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_get_comments
@@ -758,6 +829,11 @@ async def word_live_get_comments(filename: str = None) -> str:
         comments = []
         for i in range(1, doc.Comments.Count + 1):
             c = doc.Comments(i)
+            # Skip replies in top-level iteration (Word COM doc.Comments is a flat list)
+            if hasattr(c, "Ancestor") and c.Ancestor is not None:
+                continue
+
+            c_id = generate_comment_id(c)
             scope_text = ""
             try:
                 scope_text = c.Scope.Text[:100] if c.Scope and c.Scope.Text else ""
@@ -769,8 +845,11 @@ async def word_live_get_comments(filename: str = None) -> str:
             try:
                 for r_idx in range(1, c.Replies.Count + 1):
                     r = c.Replies(r_idx)
+                    r_id = generate_comment_id(r, parent_id=c_id, reply_index=r_idx)
                     replies.append({
-                        "index": r.Index,
+                        "comment_id": r_id,
+                        "index": r_idx,
+                        "global_index": getattr(r, "Index", None),
                         "author": str(r.Author) if r.Author else "",
                         "date": str(r.Date) if r.Date else "",
                         "text": str(r.Range.Text) if r.Range and r.Range.Text else "",
@@ -779,6 +858,7 @@ async def word_live_get_comments(filename: str = None) -> str:
                 pass  # Replies not supported in older Word versions
 
             comment_data = {
+                "comment_id": c_id,
                 "index": i,
                 "author": str(c.Author) if c.Author else "",
                 "date": str(c.Date) if c.Date else "",
@@ -790,17 +870,24 @@ async def word_live_get_comments(filename: str = None) -> str:
                 comment_data["reply_count"] = len(replies)
             comments.append(comment_data)
 
-        return json.dumps({
+        res = {
             "success": True,
             "document": doc.Name,
             "comment_count": len(comments),
+            "total_threads": len(comments),
+            "total_comments_in_doc": doc.Comments.Count,
             "comments": comments,
-        }, ensure_ascii=False)
+        }
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            res["target_warning"] = target_warning
+        return json.dumps(res, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_comment(
     filename: str = None,
     start: int = None,
@@ -810,6 +897,10 @@ async def word_live_add_comment(
     author: str = DEFAULT_AUTHOR,
 ) -> str:
     """Add a comment to an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Index Shift Rule: Adding a comment inserts a new entry, shifting positional indices.
+      The returned 'comment_id' is stable across future comment insertions and deletions.
 
     Specify either start/end character positions or paragraph_index.
     If paragraph_index is given, the comment is attached to the entire paragraph.
@@ -823,7 +914,7 @@ async def word_live_add_comment(
         author: Comment author name.
 
     Returns:
-        JSON with result info.
+        JSON with comment info, stable comment_id, and index shift note.
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_add_comment
@@ -864,37 +955,47 @@ async def word_live_add_comment(
             finally:
                 app.UserName = prev_author
 
+        c_id = generate_comment_id(comment)
         return json.dumps({
             "success": True,
             "document": doc.Name,
+            "comment_id": c_id,
             "comment_index": comment.Index,
             "author": author,
             "text": text[:100],
+            "index_shift_note": f"Comments after index {comment.Index} shifted +1 in positional index.",
         }, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_reply_to_comment(
     filename: str = None,
+    comment_id: str = None,
     comment_index: int = None,
     text: str = "",
     author: str = DEFAULT_AUTHOR,
 ) -> str:
     """Reply to an existing comment in an open Word document.
 
-    Adds a threaded reply to a top-level comment. Requires Word 2016 or later.
-    Use word_live_get_comments to find the comment_index.
+    CONVENTIONS & INVARIANTS:
+    - Index Shift Rule: Adding a reply inserts a new entry, shifting positional indices.
+      Prefer comment_id over comment_index to guarantee targeting the correct thread.
+    - Target Echo: Every reply response includes 'replied_to' with comment_id, author, and excerpt.
+
+    Adds a threaded reply to a comment. Requires Word 2016 or later.
 
     Args:
         filename: Document name or path (None = active document).
-        comment_index: 1-indexed comment to reply to.
+        comment_id: Stable comment ID (e.g. 'c_a8f3b9012e4c'). Preferred.
+        comment_index: 1-indexed comment to reply to (deprecated fallback).
         text: Reply text.
         author: Reply author name.
 
     Returns:
-        JSON with reply info.
+        JSON with reply info, target echo (replied_to), and index shift note.
     """
     if _MAC_AVAILABLE:
         return json.dumps({"error": "word_live_reply_to_comment is not available on macOS — the AppleScript dictionary does not expose this feature"})
@@ -902,8 +1003,8 @@ async def word_live_reply_to_comment(
     if sys.platform != "win32":
         return json.dumps({"error": "Live tools are only available on Windows"})
 
-    if comment_index is None:
-        return json.dumps({"error": "comment_index is required"})
+    if comment_id is None and comment_index is None:
+        return json.dumps({"error": "Either comment_id or comment_index is required"})
     if not text:
         return json.dumps({"error": "Reply text is required"})
 
@@ -913,18 +1014,20 @@ async def word_live_reply_to_comment(
         app = get_word_app()
         doc = find_document(app, filename)
 
-        if comment_index < 1 or comment_index > doc.Comments.Count:
-            return json.dumps({
-                "error": f"comment_index {comment_index} out of range (1-{doc.Comments.Count})"
-            })
+        try:
+            target_obj, meta = resolve_comment(doc, comment_id=comment_id, comment_index=comment_index)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
 
-        comment = doc.Comments(comment_index)
+        # If target was a reply, attach to its parent top-level comment
+        parent = meta.get("parent_comment") or target_obj
+        parent_id = meta.get("parent_comment_id") or meta["comment_id"]
 
         with undo_record(app, "MCP: Reply to Comment"):
             prev_author = app.UserName
             app.UserName = author
             try:
-                reply = comment.Replies.Add(comment.Scope, text)
+                reply = parent.Replies.Add(parent.Scope, text)
             except AttributeError:
                 return json.dumps({
                     "error": "Comment replies require Word 2016 or later."
@@ -932,36 +1035,53 @@ async def word_live_reply_to_comment(
             finally:
                 app.UserName = prev_author
 
+        new_reply_idx = parent.Replies.Count
+        reply_id = generate_comment_id(reply, parent_id=parent_id, reply_index=new_reply_idx)
         return json.dumps({
             "success": True,
+            "action": "reply",
             "document": doc.Name,
-            "comment_index": comment_index,
-            "reply_text": text[:100],
-            "reply_index": reply.Index,
+            "replied_to": {
+                "comment_id": meta["comment_id"],
+                "author": meta["author"],
+                "excerpt": meta["excerpt"],
+            },
+            "reply_comment_id": reply_id,
+            "reply_index": new_reply_idx,
+            "global_index": getattr(reply, "Index", None),
             "author": author,
+            "reply_text": text[:100],
+            "index_shift_note": f"Comments after index {meta['index']} shifted +1 in positional index.",
         }, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_resolve_comment(
     filename: str = None,
+    comment_id: str = None,
     comment_index: int = None,
     resolve: bool = True,
 ) -> str:
     """Resolve or unresolve a comment in an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Index Shift Rule: UI-side resolving/deleting mutates positional indices. Prefer comment_id.
+    - Target Echo: Response includes 'resolved_comment' with author and excerpt.
 
     Marks a comment thread as resolved (Done) or re-opens it.
     Requires Word 2016 or later.
 
     Args:
         filename: Document name or path (None = active document).
-        comment_index: 1-indexed comment to resolve/unresolve.
+        comment_id: Stable comment ID (e.g. 'c_a8f3b9012e4c'). Preferred.
+        comment_index: 1-indexed comment to resolve/unresolve (fallback).
         resolve: True to resolve (mark done), False to unresolve (re-open).
 
     Returns:
-        JSON with result info.
+        JSON with result info and target echo (resolved_comment).
     """
     if _MAC_AVAILABLE:
         return json.dumps({"error": "word_live_resolve_comment is not available on macOS — the AppleScript dictionary does not expose this feature"})
@@ -969,8 +1089,8 @@ async def word_live_resolve_comment(
     if sys.platform != "win32":
         return json.dumps({"error": "Live tools are only available on Windows"})
 
-    if comment_index is None:
-        return json.dumps({"error": "comment_index is required"})
+    if comment_id is None and comment_index is None:
+        return json.dumps({"error": "Either comment_id or comment_index is required"})
 
     try:
         from word_document_server.core.word_com import get_word_app, find_document
@@ -978,15 +1098,13 @@ async def word_live_resolve_comment(
         app = get_word_app()
         doc = find_document(app, filename)
 
-        if comment_index < 1 or comment_index > doc.Comments.Count:
-            return json.dumps({
-                "error": f"comment_index {comment_index} out of range (1-{doc.Comments.Count})"
-            })
-
-        comment = doc.Comments(comment_index)
+        try:
+            target_obj, meta = resolve_comment(doc, comment_id=comment_id, comment_index=comment_index)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
 
         try:
-            comment.Done = resolve
+            target_obj.Done = resolve
         except AttributeError:
             return json.dumps({
                 "error": "Comment resolve/unresolve requires Word 2016 or later."
@@ -1002,10 +1120,15 @@ async def word_live_resolve_comment(
 
         return json.dumps({
             "success": True,
+            "action": "resolve" if resolve else "unresolve",
             "document": doc.Name,
-            "comment_index": comment_index,
+            "resolved_comment": {
+                "comment_id": meta["comment_id"],
+                "author": meta["author"],
+                "excerpt": meta["excerpt"],
+            },
+            "comment_index": meta["index"],
             "resolved": resolve,
-            "comment_text": str(comment.Range.Text)[:100] if comment.Range else "",
             "warning": "Comment.Done may not be visible in Modern Comments UI (M365 limitation)",
         }, ensure_ascii=False)
 
@@ -1013,18 +1136,30 @@ async def word_live_resolve_comment(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_delete_comment(
     filename: str = None,
+    comment_id: str = None,
     comment_index: int = None,
+    delete_recursively: bool = True,
 ) -> str:
     """Delete a comment from an open Word document.
 
+    CONVENTIONS & INVARIANTS:
+    - Index Shift Rule: Deleting a comment shifts all subsequent comments by -1.
+      Prefer comment_id over comment_index to prevent wrong-thread deletions.
+    - Target Echo: Response echoes 'deleted_comment' with comment_id, author, and excerpt.
+    - Threaded Comments: If a comment has replies, Word requires deleting recursively.
+      delete_recursively=True (default) removes the comment and all its replies.
+
     Args:
         filename: Document name or path (None = active document).
-        comment_index: 1-indexed comment to delete.
+        comment_id: Stable comment ID (e.g. 'c_a8f3b9012e4c' or 'c_a8f3b9012e4c_r1'). Preferred.
+        comment_index: 1-indexed comment to delete (fallback).
+        delete_recursively: If True (default), delete comment and all replies if threaded.
 
     Returns:
-        JSON with result info.
+        JSON with result info, target echo (deleted_comment), and index shift note.
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_delete_comment
@@ -1033,8 +1168,8 @@ async def word_live_delete_comment(
     if sys.platform != "win32":
         return json.dumps({"error": "Live tools are only available on Windows"})
 
-    if comment_index is None:
-        return json.dumps({"error": "comment_index is required"})
+    if comment_id is None and comment_index is None:
+        return json.dumps({"error": "Either comment_id or comment_index is required"})
 
     try:
         from word_document_server.core.word_com import get_word_app, find_document, undo_record
@@ -1042,29 +1177,66 @@ async def word_live_delete_comment(
         app = get_word_app()
         doc = find_document(app, filename)
 
-        if comment_index < 1 or comment_index > doc.Comments.Count:
-            return json.dumps({
-                "error": f"comment_index {comment_index} out of range (1-{doc.Comments.Count})"
-            })
+        try:
+            target_obj, meta = resolve_comment(doc, comment_id=comment_id, comment_index=comment_index)
+        except ValueError as ve:
+            return json.dumps({"error": str(ve)})
 
-        comment = doc.Comments(comment_index)
-        comment_text = str(comment.Range.Text)[:100] if comment.Range else ""
+        reply_count = 0
+        try:
+            if hasattr(target_obj, "Replies") and target_obj.Replies is not None:
+                reply_count = target_obj.Replies.Count
+        except Exception:
+            pass
 
         with undo_record(app, "MCP: Delete Comment"):
-            comment.Delete()
+            try:
+                if reply_count > 0:
+                    if not delete_recursively:
+                        return json.dumps({
+                            "error": f"Comment has {reply_count} replies and cannot be deleted alone. "
+                                     f"Set delete_recursively=True to delete the thread."
+                        })
+                    target_obj.DeleteRecursively()
+                else:
+                    target_obj.Delete()
+            except Exception as del_err:
+                err_msg = str(del_err)
+                if "DeleteRecursively" in err_msg or "-2146821933" in err_msg:
+                    try:
+                        target_obj.DeleteRecursively()
+                    except Exception as retry_err:
+                        return json.dumps({
+                            "error": f"Failed to delete threaded comment: {retry_err}"
+                        })
+                else:
+                    return json.dumps({
+                        "error": f"Failed to delete comment: {del_err}"
+                    })
 
         return json.dumps({
             "success": True,
+            "action": "delete",
             "document": doc.Name,
-            "deleted_comment_index": comment_index,
-            "deleted_comment_text": comment_text,
+            "deleted_comment": {
+                "comment_id": meta["comment_id"],
+                "author": meta["author"],
+                "excerpt": meta["excerpt"],
+            },
+            "deleted_comment_index": meta["index"],
+            "deleted_recursively": reply_count > 0,
+            "deleted_replies_count": reply_count,
             "remaining_comments": doc.Comments.Count,
+            "index_shift_note": f"Comments after index {meta['index']} shifted -1 in positional index.",
         }, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+
+
+@serialize_word_com
 async def word_live_list_revisions(filename: str = None) -> str:
     """List all tracked changes (revisions) in an open Word document.
 
@@ -1134,6 +1306,7 @@ async def word_live_list_revisions(filename: str = None) -> str:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_accept_revisions(
     filename: str = None,
     author: str = None,
@@ -1206,6 +1379,7 @@ async def word_live_accept_revisions(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_reject_revisions(
     filename: str = None,
     author: str = None,
@@ -1275,12 +1449,22 @@ async def word_live_reject_revisions(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_page_text(
     filename: str = None,
     page: int = 1,
     end_page: int = None,
 ) -> str:
     """[Windows only] Get text from specific page(s) of an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Index bases: page and end_page are 1-based. paragraph_index is 1-based.
+      Character offsets (char_start, char_end) are 0-based.
+    - Field-Code Offset Inflation: In documents containing dynamic fields (e.g., EndNote citations, HYPERLINK, SEQ codes),
+      character offsets include underlying hidden field-code instruction strings. Offsets may appear significantly larger
+      than visible character counts.
+    - Coordinate Systems: char_start and char_end can be passed directly to surgical tools like
+      word_live_format_text or word_live_delete_text.
 
     Returns paragraphs on the requested page(s) with char_start/char_end offsets
     that can be passed directly to word_live_format_text, word_live_delete_text, etc.
@@ -1379,6 +1563,7 @@ async def word_live_get_page_text(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_undo_history(
     filename: str = None,
 ) -> str:
@@ -1436,6 +1621,7 @@ async def word_live_get_undo_history(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_diagnose_layout(
     filename: str = None,
 ) -> str:
@@ -1600,6 +1786,7 @@ _CORE_PROP_MAP = {
 }
 
 
+@serialize_word_com
 async def word_live_set_core_properties(
     filename: str = None,
     title: str = None,
@@ -1681,6 +1868,7 @@ async def word_live_set_core_properties(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_list_open() -> str:
     """[Windows only] List all documents currently open in Microsoft Word.
 
@@ -1771,6 +1959,7 @@ async def word_live_list_open() -> str:
 # Field code / EndNote inspection tools
 # ---------------------------------------------------------------------------
 
+@serialize_word_com
 async def word_live_list_fields(
     filename: str = None,
     field_type: str = None,
@@ -1973,6 +2162,7 @@ async def word_live_list_fields(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_get_field(
     filename: str = None,
     field_index: int = None,
@@ -2112,6 +2302,7 @@ async def word_live_get_field(
 # Macro discovery tools
 # ---------------------------------------------------------------------------
 
+@serialize_word_com
 async def word_live_list_macros(
     filename: str = None,
     filter: str = None,
@@ -2172,3 +2363,109 @@ async def word_live_list_macros(
             "error": str(e),
             "traceback": traceback.format_exc(),
         })
+
+
+@serialize_word_com
+async def word_live_list_inline_shapes(filename: str = None) -> str:
+    """[Windows only] List all inline shapes (images, charts, embedded objects) in an open Word document.
+
+    Returns dimensions, shape type, link target, paragraph index, and page number for each shape.
+    Requires Word running on Windows.
+
+    CONVENTIONS & INVARIANTS:
+    - shape_index: 1-based index (1 to shape_count) for use with word_live_replace_inline_image.
+    - paragraph_index: 1-based index of the containing paragraph.
+    - Dimensions are reported in points (pt) and inches (1 in = 72 pt).
+
+    Args:
+        filename: Document filename or path (None = active document).
+
+    Returns:
+        JSON with shape_count and list of shape metadata dictionaries.
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live tools are only available on Windows"})
+
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        from word_document_server.core.word_com import get_word_app, find_document
+
+        app = get_word_app(filename)
+        doc = find_document(app, filename)
+
+        SHAPE_TYPE_NAMES = {
+            1: "embedded_ole",
+            2: "link_embedded_ole",
+            3: "inline_picture",
+            4: "linked_picture",
+            12: "chart",
+            15: "smartart",
+        }
+
+        shapes_list = []
+        count = doc.InlineShapes.Count
+
+        for i in range(1, count + 1):
+            try:
+                shape = doc.InlineShapes(i)
+                w_pt = float(shape.Width)
+                h_pt = float(shape.Height)
+                shape_type_code = int(shape.Type)
+                type_name = SHAPE_TYPE_NAMES.get(shape_type_code, f"type_{shape_type_code}")
+
+                # Check if linked
+                link_path = None
+                is_linked = (shape_type_code == 4)
+                if hasattr(shape, "LinkFormat") and shape.LinkFormat is not None:
+                    try:
+                        link_path = shape.LinkFormat.SourceFullName
+                        is_linked = True
+                    except Exception:
+                        pass
+
+                # Calculate paragraph index and page number
+                rng = shape.Range
+                start_offset = int(rng.Start)
+                doc_end = doc.Content.End
+                para_index = doc.Range(0, min(doc_end, start_offset + 1)).Paragraphs.Count
+                try:
+                    page = int(rng.Information(3))  # wdActiveEndAdjustedPageNumber
+                except Exception:
+                    page = None
+
+                title = _safe_attr(shape, "Title", None)
+                alt_text = _safe_attr(shape, "AlternativeText", None)
+
+                shapes_list.append({
+                    "shape_index": i,
+                    "shape_type": type_name,
+                    "type_code": shape_type_code,
+                    "width_pt": round(w_pt, 2),
+                    "height_pt": round(h_pt, 2),
+                    "width_inches": round(w_pt / 72.0, 3),
+                    "height_inches": round(h_pt / 72.0, 3),
+                    "is_linked": is_linked,
+                    "link_source": link_path,
+                    "start_offset": start_offset,
+                    "paragraph_index": para_index,
+                    "page": page,
+                    "title": title if title else None,
+                    "alt_text": alt_text if alt_text else None,
+                })
+            except Exception as shape_err:
+                shapes_list.append({
+                    "shape_index": i,
+                    "error": str(shape_err),
+                })
+
+        return json.dumps({
+            "success": True,
+            "document": doc.Name,
+            "shape_count": count,
+            "shapes": shapes_list,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+

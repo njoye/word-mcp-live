@@ -10,6 +10,7 @@ import re
 import sys
 
 from word_document_server.defaults import DEFAULT_AUTHOR
+from word_document_server.core.word_com import serialize_word_com, get_document_target_warning
 # macOS JXA dispatch
 _MAC_AVAILABLE = __import__('sys').platform == 'darwin'
 
@@ -22,6 +23,7 @@ WD_STORY = 6
 _INSERT_CHUNK_SIZE = 30000
 
 
+@serialize_word_com
 async def word_live_insert_text(
     filename: str = None,
     text: str = "",
@@ -32,6 +34,12 @@ async def word_live_insert_text(
     """Insert text into an open Word document.
 
     Automatically chunks large text (>30K chars) to avoid Word COM limits.
+
+    CONVENTIONS & INVARIANTS:
+    - Character positions / offsets are 0-based.
+    - When inserting at character offsets or bookmark positions, surrounding text and paragraph marks are preserved.
+    - If track_changes is True and tracked revisions are enabled, inserted text is marked as an insertion revision.
+    - If track_changes is False, agent must obtain explicit user permission before executing untracked edits.
 
     Args:
         filename: Document name or path (None = active document).
@@ -126,12 +134,16 @@ async def word_live_insert_text(
         }
         if len(chunks) > 1:
             result["chunks_used"] = len(chunks)
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            result["target_warning"] = target_warning
         return json.dumps(result)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_format_text(
     filename: str = None,
     start: int = None,
@@ -158,6 +170,12 @@ async def word_live_format_text(
     Two addressing modes (provide one):
     - start/end: Character positions (from word_live_find_text or word_live_get_page_text).
     - start_paragraph/end_paragraph: 1-indexed paragraph range (from word_live_get_text etc.).
+
+    CONVENTIONS & INVARIANTS:
+    - Character offsets (start, end) are 0-based (matching word_live_find_text spans).
+    - Paragraph indices (start_paragraph, end_paragraph) are 1-based (matching word_live_get_text paragraph list and word_live_find_text match coordinate bridge).
+    - Text content is never modified; only formatting attributes are applied.
+    - If track_changes is False, agent must obtain explicit user permission before making untracked formatting revisions.
 
     Args:
         filename: Document name or path (None = active document).
@@ -314,20 +332,23 @@ async def word_live_format_text(
         if len(preview) > 50:
             preview = preview[:50] + "..."
 
-        return json.dumps(
-            {
-                "success": True,
-                "document": doc.Name,
-                "range": range_label,
-                "text_preview": preview,
-                "tracked": track_changes,
-            }
-        )
+        res = {
+            "success": True,
+            "document": doc.Name,
+            "range": range_label,
+            "text_preview": preview,
+            "tracked": track_changes,
+        }
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            res["target_warning"] = target_warning
+        return json.dumps(res)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_apply_list(
     filename: str = None,
     start_paragraph: int = None,
@@ -513,6 +534,7 @@ async def word_live_apply_list(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_setup_heading_numbering(
     filename: str = None,
     h1_paragraphs: list = None,
@@ -533,7 +555,7 @@ async def word_live_setup_heading_numbering(
     h2_space_after: float = None,
     line_spacing: float = None,
 ) -> str:
-    """[Windows only] Set up auto-numbered headings with multilevel list (1. / 1.1).
+    r"""[Windows only] Set up auto-numbered headings with multilevel list (1. / 1.1).
 
     Creates a multilevel list template linked to Heading 1 and Heading 2 styles.
     Default formats: Level 1 = "%1." (produces "1."), Level 2 = "%1.%2" (produces "1.1").
@@ -912,6 +934,7 @@ async def word_live_setup_heading_numbering(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_replace_text(
     filename: str = None,
     find_text: str = "",
@@ -919,10 +942,27 @@ async def word_live_replace_text(
     match_case: bool = False,
     match_whole_word: bool = False,
     use_wildcards: bool = False,
-    replace_all: bool = True,
+    replace_all: bool = None,
+    occurrence: int = None,
+    start_after: int = None,
     track_changes: bool = False,
 ) -> str:
     """[Windows only] Find and replace text in an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Index bases: Character offsets (start, end) are 0-based. start_after is 0-based.
+    - Tracked Changes Offset Stability: Under Track Changes (TrackRevisions=True), deleted characters
+      remain in the document model; character offsets do NOT shift after deletions until revisions are accepted.
+    - Anchor guidance: Use at least one full unique sentence as the find anchor; check match_count == 1
+      in word_live_find_text before replacing. Short anchors hit multiple locations.
+    - Per-Occurrence replacement: Use occurrence=N (1-based) to replace a specific instance.
+      Automatically disables replace_all. Error if occurrence > match count.
+    - Tracked Changes Policy: IMPORTANT: You MUST set track_changes=True unless the user has explicitly
+      granted permission to make untracked edits (track_changes=False). Note: replace_all defaults to False
+      when track_changes=True or start_after is specified to safely prevent infinite loops and unintentional multi-replaces.
+      Explicit replace_all=True with track_changes=True is rejected because Word COM enters an infinite loop.
+    - Multi-Document Safety: When multiple documents are open in Word, always specify 'filename' explicitly
+      to prevent unintentional mutations on background windows when focus shifts.
 
     Supports search and replacement strings of arbitrary length (automatically handles Word's
     255-character limit via chunked prefix matching and direct Range text assignment).
@@ -937,11 +977,13 @@ async def word_live_replace_text(
         match_case: Case-sensitive search.
         match_whole_word: Match whole words only (ignored when use_wildcards=True).
         use_wildcards: Enable Word wildcards and special characters.
-        replace_all: Replace all occurrences (True) or just the first one (False).
-        track_changes: Track replacements as revisions. IMPORTANT: You MUST set this to True unless the user has explicitly granted permission to make untracked edits (track_changes=False). Note: replace_all=True with track_changes=True causes an infinite loop in Word COM, so use replace_all=False when tracking changes.
+        replace_all: Replace all occurrences (True) or just the first one (False). Defaults to False if track_changes=True or start_after is set, True otherwise.
+        occurrence: 1-based occurrence number to replace (e.g. 2 = replace second match only). Automatically sets replace_all=False.
+        start_after: Character position to begin searching after (e.g. from previous find_text end offset). Defaults replace_all=False.
+        track_changes: Track replacements as revisions.
 
     Returns:
-        JSON with count of replacements made.
+        JSON with count of replacements made and replaced positions.
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_replace_text
@@ -952,6 +994,17 @@ async def word_live_replace_text(
 
     if not find_text:
         return json.dumps({"error": "find_text is required"})
+
+    if occurrence is not None:
+        if occurrence < 1:
+            return json.dumps({"error": "occurrence must be a positive integer >= 1"})
+        replace_all = False
+
+    if start_after is not None and occurrence is None and replace_all is None:
+        replace_all = False
+
+    if replace_all is None:
+        replace_all = False if track_changes else True
 
     if use_wildcards and len(find_text) > 255:
         return json.dumps({
@@ -971,11 +1024,16 @@ async def word_live_replace_text(
         return json.dumps({
             "error": "replace_all=True with track_changes=True causes an infinite loop "
             "(tracked deletions stay visible to Find, triggering endless re-replacement). "
-            "Use replace_all=False — each unique text only needs one replacement."
+            "Use replace_all=False or specify occurrence=N."
         })
 
     try:
-        from word_document_server.core.word_com import get_word_app, find_document, undo_record
+        from word_document_server.core.word_com import (
+            get_word_app,
+            find_document,
+            undo_record,
+            get_document_target_warning,
+        )
         from word_document_server.utils.find_utils import (
             prepare_find_prefix,
             calculate_word_char_length,
@@ -1000,9 +1058,27 @@ async def word_live_replace_text(
 
             try:
                 count = 0
+                match_counter = 0
+                replaced_positions = []
                 MAX_REPLACEMENTS = 50_000  # safety ceiling
                 rng = doc.Content.Duplicate
                 rng.Find.ClearFormatting()
+
+                if start_after is not None:
+                    start_pos = max(0, start_after)
+                    doc_end_pos = doc.Content.End
+                    if start_pos >= doc_end_pos:
+                        return json.dumps({
+                            "success": True,
+                            "document": doc.Name,
+                            "find_text": find_text,
+                            "replace_text": replace_text,
+                            "replacements": 0,
+                            "replaced_positions": [],
+                            "message": f"start_after ({start_after}) is at or beyond document end ({doc_end_pos}).",
+                            "tracked": track_changes,
+                        }, ensure_ascii=False)
+                    rng.SetRange(start_pos, doc_end_pos)
 
                 is_long = len(find_text) > 255
                 if is_long:
@@ -1084,10 +1160,24 @@ async def word_live_replace_text(
                         target_rng = rng
                         target_start = found_start
 
+                    match_counter += 1
+                    if occurrence is not None and match_counter < occurrence:
+                        last_start = target_start
+                        next_pos = target_rng.End if target_rng.End > target_start else target_start + 1
+                        rng.SetRange(next_pos, next_pos)
+                        continue
+
                     target_rng.Text = processed
                     count += 1
                     last_start = target_start
+                    replaced_positions.append({
+                        "occurrence": match_counter,
+                        "start": target_start,
+                        "end": target_start + len(processed),
+                    })
 
+                    if occurrence is not None:
+                        break
                     if not replace_all:
                         break
                     if count >= MAX_REPLACEMENTS:
@@ -1100,20 +1190,33 @@ async def word_live_replace_text(
                 if track_changes:
                     app.UserName = prev_author
 
-        return json.dumps({
+        if occurrence is not None and count == 0:
+            return json.dumps({
+                "error": f"Requested occurrence {occurrence} not found. Document contains only {match_counter} match(es) for '{find_text}'."
+            })
+
+        res = {
             "success": True,
             "document": doc.Name,
             "find_text": find_text,
             "replace_text": replace_text,
             "replacements": count,
+            "replaced_positions": replaced_positions,
             "replace_all": replace_all,
             "tracked": track_changes,
-        }, ensure_ascii=False)
+        }
+        if occurrence is not None:
+            res["occurrence_requested"] = occurrence
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            res["target_warning"] = target_warning
+        return json.dumps(res, ensure_ascii=False)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_insert_paragraphs(
     filename: str = None,
     paragraphs: list = None,
@@ -1127,6 +1230,13 @@ async def word_live_insert_paragraphs(
 
     Targets by text match or paragraph index (0-based, matching word_live_get_text output).
     Inserts all paragraphs in a single undo record.
+
+    CONVENTIONS & INVARIANTS:
+    - target_paragraph_index is 0-based (matching word_live_get_text output array offset).
+    - When target_text is used, the first paragraph containing target_text is matched.
+    - All paragraphs are inserted within a single undo transaction.
+    - If track_changes is True and TrackRevisions is enabled, inserted paragraphs are tracked as revisions.
+    - If track_changes is False, agent must obtain explicit user permission before making untracked edits.
 
     Args:
         filename: Document name or path (None = active document).
@@ -1241,6 +1351,7 @@ async def word_live_insert_paragraphs(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_table(
     filename: str = None,
     rows: int = 2,
@@ -1389,6 +1500,7 @@ async def word_live_add_table(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_format_table(
     filename: str = None,
     table_index: int = -1,
@@ -1569,6 +1681,7 @@ async def word_live_format_table(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_delete_text(
     filename: str = None,
     start: int = None,
@@ -1576,6 +1689,12 @@ async def word_live_delete_text(
     track_changes: bool = False,
 ) -> str:
     """Delete text from an open Word document.
+
+    CONVENTIONS & INVARIANTS:
+    - Character offsets (start, end) are 0-based.
+    - Offsets become stale immediately after untracked deletions; call word_live_find_text again before subsequent operations.
+    - If track_changes is True and TrackRevisions is active, deletions are recorded as tracked deletion revisions without shifting character offsets until accepted.
+    - If track_changes is False, agent must obtain explicit user permission before making untracked edits.
 
     Args:
         filename: Document name or path.
@@ -1633,20 +1752,23 @@ async def word_live_delete_text(
         if len(preview) > 100:
             preview = preview[:100] + "..."
 
-        return json.dumps(
-            {
-                "success": True,
-                "document": doc.Name,
-                "deleted_text": preview,
-                "range": f"{start}-{end}",
-                "tracked": track_changes,
-            }
-        )
+        res = {
+            "success": True,
+            "document": doc.Name,
+            "deleted_text": preview,
+            "range": f"{start}-{end}",
+            "tracked": track_changes,
+        }
+        target_warning = get_document_target_warning(app, filename)
+        if target_warning:
+            res["target_warning"] = target_warning
+        return json.dumps(res)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_modify_table(
     filename: str = None,
     table_index: int = 1,
@@ -1823,6 +1945,7 @@ async def word_live_modify_table(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_undo(
     filename: str = None,
     times: int = 1,
@@ -1869,6 +1992,7 @@ async def word_live_undo(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_save(
     filename: str = None,
     save_as: str = None,
@@ -1928,6 +2052,7 @@ async def word_live_save(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_toggle_track_changes(
     filename: str = None,
     enable: bool = None,
@@ -1973,6 +2098,7 @@ async def word_live_toggle_track_changes(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_insert_image(
     filename: str = None,
     image_path: str = "",
@@ -1993,6 +2119,11 @@ async def word_live_insert_image(
 
     The image can be placed at a specific paragraph, at the start or end,
     or at a character offset position.
+
+    CONVENTIONS & INVARIANTS:
+    - paragraph_index is 1-based (image is inserted before that paragraph).
+    - position offsets (when used as integers) are 0-based character offsets.
+    - If wrapping is "inline", image is inserted as an InlineShape; otherwise converted to a floating Shape.
 
     Args:
         filename: Document name or path (None = active document).
@@ -2211,6 +2342,137 @@ async def word_live_insert_image(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
+async def word_live_replace_inline_image(
+    filename: str = None,
+    shape_index: int = 1,
+    image_path: str = "",
+    keep_size: bool = True,
+    force_embed: bool = False,
+    track_changes: bool = True,
+) -> str:
+    """[Windows only] Replace an existing inline image or shape in a Word document open in Word.
+
+    Swaps the inline shape at the given 1-based index with a new image file.
+    If keep_size=True, preserves the original shape's width and height in points.
+    If track_changes=True, records the replacement as tracked revisions (deletion of old, insertion of new).
+    Requires Microsoft Word running on Windows.
+
+    CONVENTIONS & INVARIANTS:
+    - shape_index: 1-based index into doc.InlineShapes (matching word_live_list_inline_shapes).
+    - Image replacement preserves surrounding paragraph structure, formatting, and captions.
+    - If keep_size is True, the new image inherits the original shape's point dimensions.
+    - If track_changes is True and TrackRevisions is enabled, replacement creates tracked revision records.
+    - If track_changes is False, agent must obtain explicit user permission before executing untracked edits.
+
+    Args:
+        filename: Document filename (e.g., "report.docx"). Defaults to active document.
+        shape_index: 1-based index of the inline shape to replace (default: 1).
+        image_path: Path to the replacement image file (absolute or relative to workspace).
+        keep_size: If True (default), preserve the existing shape's width and height.
+        force_embed: If True, convert a linked picture into an embedded picture.
+        track_changes: If True (default), ensures tracked changes are enabled for replacement.
+            If False, disables tracked changes (requires user permission).
+    """
+    if sys.platform != "win32":
+        return json.dumps({"error": "Live Word editing is only supported on Windows"})
+
+    if not image_path:
+        return json.dumps({"error": "image_path is required"})
+
+    abs_path = os.path.abspath(image_path)
+    if not os.path.exists(abs_path):
+        return json.dumps({"error": f"Image file not found: {abs_path}"})
+
+    try:
+        from word_document_server.core.word_com import get_word_app, find_document, undo_record
+
+        app = get_word_app(filename)
+        doc = find_document(app, filename)
+
+        total_shapes = doc.InlineShapes.Count
+        if shape_index < 1 or shape_index > total_shapes:
+            return json.dumps({
+                "error": f"shape_index {shape_index} is out of bounds (document has {total_shapes} inline shape(s))"
+            })
+
+        old_shape = doc.InlineShapes(shape_index)
+        orig_w = float(old_shape.Width)
+        orig_h = float(old_shape.Height)
+        orig_type = int(old_shape.Type)
+        old_rng = old_shape.Range
+
+        orig_track = bool(doc.TrackRevisions)
+        if track_changes is not None:
+            doc.TrackRevisions = track_changes
+
+        try:
+            with undo_record(app, "MCP: Replace Inline Image"):
+                action = "replaced"
+                # If shape is a linked picture (Type == 4) and has LinkFormat, try updating link unless force_embed=True
+                if orig_type == 4 and not force_embed and hasattr(old_shape, "LinkFormat") and old_shape.LinkFormat is not None:
+                    try:
+                        old_shape.LinkFormat.SourceFullName = abs_path
+                        old_shape.LinkFormat.Update()
+                        new_shape = old_shape
+                        if keep_size:
+                            new_shape.Width = orig_w
+                            new_shape.Height = orig_h
+                        action = "updated_link"
+                    except Exception:
+                        action = "replaced"
+
+                if action != "updated_link":
+                    # For embedded picture or fallback / force_embed:
+                    # In Word COM, doc.InlineShapes.AddPicture inserts at Range=old_rng.
+                    # We must then delete old_shape to complete the in-place replacement.
+                    new_shape = doc.InlineShapes.AddPicture(
+                        FileName=abs_path,
+                        LinkToFile=False,
+                        SaveWithDocument=True,
+                        Range=old_rng,
+                    )
+                    if keep_size:
+                        new_shape.Width = orig_w
+                        new_shape.Height = orig_h
+
+                    # Delete original shape: creates tracked revision delete if TrackRevisions is on
+                    old_shape.Delete()
+
+                doc_end = doc.Content.End
+                new_start = new_shape.Range.Start
+                para_idx = doc.Range(0, min(doc_end, new_start + 1)).Paragraphs.Count
+                page_num = new_shape.Range.Information(3)
+
+                res = {
+                    "success": True,
+                    "document": doc.Name,
+                    "shape_index": shape_index,
+                    "action": action,
+                    "image": os.path.basename(abs_path),
+                    "original_type": "linked_picture" if orig_type == 4 else "inline_picture" if orig_type == 3 else f"type_{orig_type}",
+                    "width_pt": new_shape.Width,
+                    "height_pt": new_shape.Height,
+                    "paragraph_index": para_idx,
+                    "page": page_num,
+                    "keep_size": keep_size,
+                    "force_embed": force_embed,
+                    "tracked_changes": doc.TrackRevisions,
+                    "shape_count": doc.InlineShapes.Count,
+                }
+                target_warning = get_document_target_warning(app, filename)
+                if target_warning:
+                    res["target_warning"] = target_warning
+                return json.dumps(res, ensure_ascii=False)
+        finally:
+            if track_changes is not None:
+                doc.TrackRevisions = orig_track
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@serialize_word_com
 async def word_live_insert_cross_reference(
     filename: str = None,
     ref_type: str = "heading",
@@ -2328,6 +2590,7 @@ async def word_live_insert_cross_reference(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_list_cross_reference_items(
     filename: str = None,
     ref_type: str = "heading",
@@ -2437,6 +2700,7 @@ async def word_live_list_cross_reference_items(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_insert_equation(
     filename: str = None,
     equation: str = "",
@@ -2616,6 +2880,7 @@ async def word_live_insert_equation(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_update_field_code(
     filename: str = None,
     field_index: int = 1,
@@ -2694,6 +2959,7 @@ async def word_live_update_field_code(
 # Macro execution tools
 # ---------------------------------------------------------------------------
 
+@serialize_word_com
 async def word_live_run_macro(
     macro_name: str,
     args: list = None,

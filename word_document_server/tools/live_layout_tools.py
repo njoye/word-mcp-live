@@ -8,6 +8,8 @@ management for files that are open (and locked) in Word.
 import json
 import sys
 
+from word_document_server.core.word_com import serialize_word_com
+
 # macOS JXA dispatch
 _MAC_AVAILABLE = sys.platform == 'darwin'
 
@@ -15,6 +17,7 @@ _MAC_AVAILABLE = sys.platform == 'darwin'
 _PTS_PER_INCH = 72.0
 
 
+@serialize_word_com
 async def word_live_set_page_layout(
     filename: str = None,
     section_index: int = 1,
@@ -112,6 +115,7 @@ async def word_live_set_page_layout(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_header_footer(
     filename: str = None,
     section_index: int = 1,
@@ -186,6 +190,7 @@ async def word_live_add_header_footer(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_page_numbers(
     filename: str = None,
     section_index: int = 1,
@@ -285,6 +290,7 @@ async def word_live_add_page_numbers(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_section_break(
     filename: str = None,
     break_type: str = "new_page",
@@ -341,6 +347,7 @@ async def word_live_add_section_break(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_set_paragraph_spacing(
     filename: str = None,
     paragraph_index: int = None,
@@ -445,6 +452,7 @@ async def word_live_set_paragraph_spacing(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_bookmark(
     filename: str = None,
     paragraph_index: int = 1,
@@ -496,6 +504,7 @@ async def word_live_add_bookmark(
         return json.dumps({"error": str(e)})
 
 
+@serialize_word_com
 async def word_live_add_watermark(
     filename: str = None,
     text: str = "TASLAK",

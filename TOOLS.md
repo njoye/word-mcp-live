@@ -169,6 +169,11 @@ These work on Windows, macOS, and Linux using python-docx. The document file mus
 
 These require Windows with Microsoft Word installed. They operate on documents **currently open in Word** via COM automation. Every tool call is a single Ctrl+Z entry in Word's undo stack.
 
+> [!IMPORTANT]
+> **Multi-Document Safety**: When multiple documents are open in Word, **always specify `filename` explicitly** (e.g. `filename="report.docx"`). If `filename` is omitted, operations target whichever document is frontmost/active in Word, which can shift when other windows take focus. A `"target_warning"` field is included in responses if `filename` is omitted while multiple documents are open.
+>
+> **Concurrency & Thread Safety**: Word COM runs in a Single-Threaded Apartment (STA). All `word_live_*` tool calls are automatically serialized using an async re-entrant mutex with exponential backoff retries on `RPC_E_CALL_REJECTED` (`0x80010001`), protecting against concurrent call collisions.
+
 <details open>
 <summary><b>Editing</b></summary>
 
@@ -176,7 +181,7 @@ These require Windows with Microsoft Word installed. They operate on documents *
 |------|-------------|
 | `word_live_insert_text` | Insert text at a position (with optional tracked changes) |
 | `word_live_delete_text` | Delete a character range |
-| `word_live_replace_text` | Find & replace via COM — works across tracked change boundaries; supports wildcards including `^s` (non-breaking space) |
+| `word_live_replace_text` | Find & replace via COM — works across tracked change boundaries; supports wildcards including `^s`. `replace_all` safely defaults to `False` when `track_changes=True` or `start_after` is set; explicit `replace_all=True` with `track_changes=True` is guarded against infinite loops |
 | `word_live_insert_paragraphs` | Insert multiple paragraphs near a target (by text or index) in a single undo record |
 | `word_live_format_text` | Format text (bold, italic, font, highlight, paragraph alignment, page break before) |
 | `word_live_add_table` | Insert a table |
@@ -187,6 +192,7 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_save` | Save document in place or save-as to a new path (docx, pdf, rtf, txt) |
 | `word_live_toggle_track_changes` | Toggle or explicitly set track changes mode on/off |
 | `word_live_insert_image` | Insert an image with sizing, alignment, wrapping, and optional border |
+| `word_live_replace_inline_image` | In-place replacement of inline image/figure with dimension preservation and tracked revisions |
 | `word_live_insert_cross_reference` | Insert a live cross-reference to headings, bookmarks, figures, tables, equations, footnotes, or endnotes |
 | `word_live_insert_equation` | Insert a mathematical equation using UnicodeMath syntax |
 | `word_live_update_field_code` | Update field instruction code (wrapped in undo record, optional recalculate) |
@@ -207,7 +213,8 @@ These require Windows with Microsoft Word installed. They operate on documents *
 | `word_live_get_page_text` | Get text from specific page(s) with char offsets for chaining |
 | `word_live_get_paragraph_format` | Inspect paragraph formatting (font, spacing, alignment, list info, per-run detail) |
 | `word_live_get_info` | Get document metadata (pages, words, sections) |
-| `word_live_find_text` | Find text with context; supports wildcards |
+| `word_live_find_text` | Find text with context, span deduplication, and paragraph_index/page coordinate bridge; supports wildcards |
+| `word_live_list_inline_shapes` | List all inline shapes/figures with dimensions, type, link target, paragraph index, and page number |
 | `word_live_get_undo_history` | List undo stack entries |
 | `word_live_list_cross_reference_items` | List available cross-reference targets (headings, bookmarks, figures, tables) with indices |
 | `word_live_diagnose_layout` | Scan for layout problems (keep_with_next chains, style misuse, break issues) |
@@ -222,12 +229,12 @@ These require Windows with Microsoft Word installed. They operate on documents *
 
 | Tool | Description |
 |------|-------------|
-| `word_live_get_comments` | Get all comments |
-| `word_live_add_comment` | Add a comment anchored to text |
+| `word_live_get_comments` | Get all comments with stable `comment_id` hash and threaded replies |
+| `word_live_add_comment` | Add a comment anchored to text, returns stable `comment_id` |
 | `word_live_list_revisions` | List tracked changes |
-| `word_live_reply_to_comment` | Add a threaded reply to an existing comment (Word 2016+) |
-| `word_live_resolve_comment` | Mark a comment as resolved or unresolve it (Word 2016+) |
-| `word_live_delete_comment` | Permanently delete a comment from the document |
+| `word_live_reply_to_comment` | Add a threaded reply by `comment_id` or `comment_index` with target echo |
+| `word_live_resolve_comment` | Mark a comment as resolved/unresolved by `comment_id` or `comment_index` with target echo |
+| `word_live_delete_comment` | Delete comment by `comment_id` or `comment_index` with target echo |
 | `word_live_accept_revisions` | Accept tracked changes (all or by author/type) |
 | `word_live_reject_revisions` | Reject tracked changes (all or by author/type) |
 
